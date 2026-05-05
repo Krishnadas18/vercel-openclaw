@@ -132,6 +132,7 @@ export function signSlackPayload(
 export type BuildSignedSlackRequestInput = {
   signingSecret: string;
   payload: Record<string, unknown>;
+  rawBody?: string;
   timestampSeconds?: number;
   url?: string;
 };
@@ -139,7 +140,7 @@ export type BuildSignedSlackRequestInput = {
 export function buildSignedSlackRequest(
   input: BuildSignedSlackRequestInput,
 ): Request {
-  const rawBody = JSON.stringify(input.payload);
+  const rawBody = input.rawBody ?? JSON.stringify(input.payload);
   const { signature, timestamp } = signSlackPayload(
     rawBody,
     input.signingSecret,

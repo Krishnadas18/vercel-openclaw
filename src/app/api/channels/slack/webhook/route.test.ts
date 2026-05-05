@@ -211,6 +211,91 @@ test("Slack webhook: duplicate event_id is deduplicated", async () => {
   });
 });
 
+test("Slack webhook: stopped sandbox posts boot message and starts wake workflow with signed handoff", async () => {
+  await withHarness(async (h) => {
+    await configureSlack(h);
+    _resetLogBuffer();
+    await h.mutateMeta((meta) => {
+      meta.status = "stopped";
+      meta.sandboxId = null;
+      meta.snapshotId = "snap-slack-wake";
+    });
+
+    h.fakeFetch.onPost(/slack\.com\/api\/chat\.postMessage$/, (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        channel?: string;
+        thread_ts?: string;
+        text?: string;
+      };
+      assert.equal(body.channel, "C-wake");
+      assert.equal(body.thread_ts, "1710000000.000100");
+      assert.match(body.text ?? "", /Waking up/);
+      return Response.json({ ok: true, ts: "boot-wake-ts" });
+    });
+
+    const payload = {
+      type: "event_callback",
+      event_id: "Ev_STOPPED_WAKE",
+      team_id: "T-wake",
+      api_app_id: "A-wake",
+      event: {
+        type: "app_mention",
+        text: "<@U-bot> are you awake?",
+        channel: "C-wake",
+        ts: "1710000000.000100",
+        thread_ts: "1710000000.000100",
+        user: "U-user",
+      },
+    };
+    const req = buildSlackWebhook({ signingSecret: SLACK_SIGNING_SECRET, payload });
+    const route = getSlackWebhookRoute();
+    const startMock = mock.method(slackWebhookWorkflowRuntime, "start", async () => {});
+
+    try {
+      const result = await callRoute(route.POST, req);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.json, { ok: true });
+      assert.equal(startMock.mock.callCount(), 1);
+
+      const call = startMock.mock.calls[0];
+      const args = call.arguments?.[1] as unknown[] | undefined;
+      assert.ok(Array.isArray(args));
+      assert.equal(args.length, 1);
+      const envelope = args[0] as {
+        version?: number;
+        channel?: string;
+        payload?: unknown;
+        bootMessageId?: string | null;
+        workflowHandoff?: {
+          slackForwardHeaders?: Record<string, string>;
+          slackRawBody?: string;
+        };
+      };
+      assert.equal(envelope.version, 1);
+      assert.equal(envelope.channel, "slack");
+      assert.deepEqual(envelope.payload, payload);
+      assert.equal(envelope.bootMessageId, "boot-wake-ts");
+      assert.equal(envelope.workflowHandoff?.slackRawBody, JSON.stringify(payload));
+      assert.equal(
+        envelope.workflowHandoff?.slackForwardHeaders?.["x-slack-signature"],
+        req.headers.get("x-slack-signature"),
+      );
+      assert.equal(
+        envelope.workflowHandoff?.slackForwardHeaders?.["x-slack-request-timestamp"],
+        req.headers.get("x-slack-request-timestamp"),
+      );
+
+      const logs = getServerLogs().map((entry) => entry.message);
+      assert.ok(logs.includes("channels.slack_fast_path_skipped"));
+      assert.ok(logs.includes("channels.slack_boot_message_sent"));
+      assert.ok(logs.includes("channels.slack_workflow_started"));
+      resetAfterCallbacks();
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
 test("Slack webhook: app_mention + message for same user post collapses to one workflow", async () => {
   await withHarness(async (h) => {
     await configureSlack(h);

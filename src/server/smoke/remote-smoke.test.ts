@@ -29,7 +29,7 @@ import {
   classifyResponse,
   parseJsonBody,
 } from "./remote-phases.js";
-import { authHeaders, setAuthCookie } from "./remote-auth.js";
+import { authHeaders, getAuthSource, setAdminSecret, setAuthCookie, setProtectionBypass } from "./remote-auth.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -268,7 +268,7 @@ test("gatewayProbe phase: fails when response is a login page", async () => {
     const r = await gatewayProbe(BASE);
     assertPhaseShape(r, "gatewayProbe");
     assert.equal(r.passed, false, "should fail on login page");
-    assert.equal(r.errorCode, "LOGIN_PAGE");
+    assert.equal(r.errorCode, "APP_AUTH_FAILED");
   } finally {
     restore();
   }
@@ -447,6 +447,52 @@ test("authHeaders: adds CSRF header for mutations", () => {
 test("authHeaders: no CSRF header for reads", () => {
   const hdrs = authHeaders();
   assert.equal(hdrs["X-Requested-With"], undefined);
+});
+
+test("authHeaders: includes admin bearer secret from env", () => {
+  const origSmoke = process.env.SMOKE_ADMIN_SECRET;
+  const origAdmin = process.env.ADMIN_SECRET;
+  delete process.env.ADMIN_SECRET;
+  process.env.SMOKE_ADMIN_SECRET = "admin-from-env";
+  try {
+    const hdrs = authHeaders();
+    assert.equal(hdrs.Authorization, "Bearer admin-from-env");
+  } finally {
+    if (origSmoke !== undefined) process.env.SMOKE_ADMIN_SECRET = origSmoke;
+    else delete process.env.SMOKE_ADMIN_SECRET;
+    if (origAdmin !== undefined) process.env.ADMIN_SECRET = origAdmin;
+    else delete process.env.ADMIN_SECRET;
+  }
+});
+
+test("authHeaders: admin override and edge bypass source are reported without values", () => {
+  const origBypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  const origSmoke = process.env.SMOKE_ADMIN_SECRET;
+  const origAdmin = process.env.ADMIN_SECRET;
+  const origCookie = process.env.SMOKE_AUTH_COOKIE;
+  delete process.env.SMOKE_AUTH_COOKIE;
+  delete process.env.SMOKE_ADMIN_SECRET;
+  delete process.env.ADMIN_SECRET;
+  delete process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  try {
+    setAdminSecret("admin-from-cli");
+    setProtectionBypass("bypass-from-cli");
+    const hdrs = authHeaders();
+    assert.equal(hdrs.Authorization, "Bearer admin-from-cli");
+    assert.equal(hdrs["x-vercel-protection-bypass"], "bypass-from-cli");
+    assert.equal(getAuthSource(), "edge-bypass+admin-secret");
+  } finally {
+    setAdminSecret(undefined);
+    setProtectionBypass(undefined);
+    if (origBypass !== undefined) process.env.VERCEL_AUTOMATION_BYPASS_SECRET = origBypass;
+    else delete process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+    if (origSmoke !== undefined) process.env.SMOKE_ADMIN_SECRET = origSmoke;
+    else delete process.env.SMOKE_ADMIN_SECRET;
+    if (origAdmin !== undefined) process.env.ADMIN_SECRET = origAdmin;
+    else delete process.env.ADMIN_SECRET;
+    if (origCookie !== undefined) process.env.SMOKE_AUTH_COOKIE = origCookie;
+    else delete process.env.SMOKE_AUTH_COOKIE;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1038,18 +1084,18 @@ test("fetch error: returns FETCH_ERROR errorCode on generic error", async () => 
 // classifyResponse unit tests
 // ---------------------------------------------------------------------------
 
-test("classifyResponse: 401 returns AUTH_FAILED", () => {
+test("classifyResponse: 401 returns APP_AUTH_FAILED", () => {
   const c = classifyResponse(401, "Unauthorized");
   assert.ok(c);
-  assert.equal(c.errorCode, "AUTH_FAILED");
+  assert.equal(c.errorCode, "APP_AUTH_FAILED");
   assert.ok(c.error.includes("401"));
   assert.ok(c.hint.includes("SMOKE_AUTH_COOKIE"));
 });
 
-test("classifyResponse: 403 returns AUTH_FAILED", () => {
+test("classifyResponse: 403 returns APP_AUTH_FAILED", () => {
   const c = classifyResponse(403, "Forbidden");
   assert.ok(c);
-  assert.equal(c.errorCode, "AUTH_FAILED");
+  assert.equal(c.errorCode, "APP_AUTH_FAILED");
   assert.ok(c.error.includes("403"));
 });
 
@@ -1068,26 +1114,26 @@ test("classifyResponse: 301 redirect returns UNEXPECTED_REDIRECT", () => {
   assert.equal(c.errorCode, "UNEXPECTED_REDIRECT");
 });
 
-test("classifyResponse: login HTML with form+password returns LOGIN_PAGE", () => {
+test("classifyResponse: login HTML with form+password returns APP_AUTH_FAILED", () => {
   const html = '<html><body><form action="/auth"><input type="password"></form></body></html>';
   const c = classifyResponse(200, html);
   assert.ok(c);
-  assert.equal(c.errorCode, "LOGIN_PAGE");
+  assert.equal(c.errorCode, "APP_AUTH_FAILED");
   assert.ok(c.hint.includes("SMOKE_AUTH_COOKIE"));
 });
 
-test("classifyResponse: Sign in with Vercel page returns LOGIN_PAGE", () => {
+test("classifyResponse: Sign in with Vercel page returns EDGE_BYPASS_FAILED", () => {
   const html = '<html><body>Sign in with Vercel to continue</body></html>';
   const c = classifyResponse(200, html);
   assert.ok(c);
-  assert.equal(c.errorCode, "LOGIN_PAGE");
+  assert.equal(c.errorCode, "EDGE_BYPASS_FAILED");
 });
 
-test("classifyResponse: __vercel_auth marker returns LOGIN_PAGE", () => {
+test("classifyResponse: __vercel_auth marker returns EDGE_BYPASS_FAILED", () => {
   const html = '<html><script>__vercel_auth()</script></html>';
   const c = classifyResponse(200, html);
   assert.ok(c);
-  assert.equal(c.errorCode, "LOGIN_PAGE");
+  assert.equal(c.errorCode, "EDGE_BYPASS_FAILED");
 });
 
 test("classifyResponse: normal 200 JSON returns null", () => {
@@ -1165,7 +1211,7 @@ test("parseJsonBody: HTML page returns MALFORMED_JSON", () => {
 // Phase integration: classifyResponse catches auth/login before phase logic
 // ---------------------------------------------------------------------------
 
-test("health phase: 401 returns AUTH_FAILED via classifyResponse", async () => {
+test("health phase: 401 returns APP_AUTH_FAILED via classifyResponse", async () => {
   const restore = installMockFetch([
     {
       pattern: /\/api\/health/,
@@ -1176,7 +1222,7 @@ test("health phase: 401 returns AUTH_FAILED via classifyResponse", async () => {
     const r = await health(BASE);
     assertPhaseShape(r, "health");
     assert.equal(r.passed, false);
-    assert.equal(r.errorCode, "AUTH_FAILED");
+    assert.equal(r.errorCode, "APP_AUTH_FAILED");
     assert.equal(r.httpStatus, 401);
     assert.ok(r.hint!.includes("SMOKE_AUTH_COOKIE"));
   } finally {
@@ -1184,7 +1230,7 @@ test("health phase: 401 returns AUTH_FAILED via classifyResponse", async () => {
   }
 });
 
-test("status phase: 403 returns AUTH_FAILED via classifyResponse", async () => {
+test("status phase: 403 returns APP_AUTH_FAILED via classifyResponse", async () => {
   const restore = installMockFetch([
     {
       pattern: /\/api\/status/,
@@ -1195,14 +1241,14 @@ test("status phase: 403 returns AUTH_FAILED via classifyResponse", async () => {
     const r = await status(BASE);
     assertPhaseShape(r, "status");
     assert.equal(r.passed, false);
-    assert.equal(r.errorCode, "AUTH_FAILED");
+    assert.equal(r.errorCode, "APP_AUTH_FAILED");
     assert.equal(r.httpStatus, 403);
   } finally {
     restore();
   }
 });
 
-test("health phase: login page returns LOGIN_PAGE via classifyResponse", async () => {
+test("health phase: login page returns APP_AUTH_FAILED via classifyResponse", async () => {
   const restore = installMockFetch([
     {
       pattern: /\/api\/health/,
@@ -1214,7 +1260,7 @@ test("health phase: login page returns LOGIN_PAGE via classifyResponse", async (
     const r = await health(BASE);
     assertPhaseShape(r, "health");
     assert.equal(r.passed, false);
-    assert.equal(r.errorCode, "LOGIN_PAGE");
+    assert.equal(r.errorCode, "APP_AUTH_FAILED");
     assert.ok(r.hint!.includes("SMOKE_AUTH_COOKIE"));
   } finally {
     restore();
@@ -1275,7 +1321,7 @@ test("channelsSummary phase: 302 redirect returns UNEXPECTED_REDIRECT", async ()
   }
 });
 
-test("gatewayProbe phase: 401 returns AUTH_FAILED via classifyResponse", async () => {
+test("gatewayProbe phase: 401 returns APP_AUTH_FAILED via classifyResponse", async () => {
   const restore = installMockFetch([
     {
       pattern: /\/gateway/,
@@ -1286,14 +1332,14 @@ test("gatewayProbe phase: 401 returns AUTH_FAILED via classifyResponse", async (
     const r = await gatewayProbe(BASE);
     assertPhaseShape(r, "gatewayProbe");
     assert.equal(r.passed, false);
-    assert.equal(r.errorCode, "AUTH_FAILED");
+    assert.equal(r.errorCode, "APP_AUTH_FAILED");
     assert.equal(r.httpStatus, 401);
   } finally {
     restore();
   }
 });
 
-test("gatewayProbe phase: login page returns LOGIN_PAGE", async () => {
+test("gatewayProbe phase: Vercel protection page returns EDGE_BYPASS_FAILED", async () => {
   const restore = installMockFetch([
     {
       pattern: /\/gateway/,
@@ -1305,7 +1351,7 @@ test("gatewayProbe phase: login page returns LOGIN_PAGE", async () => {
     const r = await gatewayProbe(BASE);
     assertPhaseShape(r, "gatewayProbe");
     assert.equal(r.passed, false);
-    assert.equal(r.errorCode, "LOGIN_PAGE");
+    assert.equal(r.errorCode, "EDGE_BYPASS_FAILED");
   } finally {
     restore();
   }
@@ -1496,6 +1542,105 @@ test("CLI: --auth-cookie overrides SMOKE_AUTH_COOKIE env var", async () => {
     ]);
     assert.equal(result.code, 0);
     assert.equal(receivedCookie, "session=cli-override-value", "server should receive CLI cookie");
+  } finally {
+    server.close();
+  }
+});
+
+test("CLI: --admin-secret sends Authorization bearer header", async () => {
+  const { createServer } = await import("node:http");
+  let receivedAuth: string | undefined;
+
+  const server = createServer((req, res) => {
+    if (req.url === "/api/status") {
+      receivedAuth = req.headers.authorization;
+    }
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/health") {
+      res.end(JSON.stringify({ ok: true }));
+    } else if (req.url === "/api/status") {
+      res.end(JSON.stringify({ status: "running", authMode: "admin-secret", storeBackend: "memory" }));
+    } else if (req.url === "/gateway" || req.url?.startsWith("/gateway/")) {
+      res.end("<html>openclaw-app</html>");
+    } else if (req.url === "/api/firewall") {
+      res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
+    } else if (req.url === "/api/channels/summary") {
+      res.end(JSON.stringify({ slack: null, telegram: null, discord: null, whatsapp: { connected: false, lastError: null, deliveryMode: "gateway-native", requiresRunningSandbox: true } }));
+    } else if (req.url === "/api/admin/ssh") {
+      res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
+    } else {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not found" }));
+    }
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address() as import("node:net").AddressInfo;
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const result = await runCli([
+      "--base-url", baseUrl,
+      "--admin-secret", "admin-cli-secret",
+    ]);
+    assert.equal(result.code, 0);
+    assert.equal(receivedAuth, "Bearer admin-cli-secret");
+  } finally {
+    server.close();
+  }
+});
+
+test("CLI: rejects x-vercel-protection-bypass in base URL", async () => {
+  const result = await runCli([
+    "--base-url",
+    "https://example.com?x-vercel-protection-bypass=secret",
+  ]);
+  assert.notEqual(result.code, 0);
+  assert.ok(result.stderr.includes("x-vercel-protection-bypass"));
+});
+
+test("CLI: --profile wake runs wake phases without self-heal phases", async () => {
+  const { createServer } = await import("node:http");
+  let statusCalls = 0;
+
+  const server = createServer((req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    if (req.url === "/api/health") {
+      res.end(JSON.stringify({ ok: true, authMode: "admin-secret", storeBackend: "memory", status: "running", hasSnapshot: false }));
+    } else if (req.url === "/api/status") {
+      statusCalls += 1;
+      res.end(JSON.stringify({ status: statusCalls > 2 ? "running" : "stopped", authMode: "admin-secret", storeBackend: "memory" }));
+    } else if (req.url === "/gateway/v1/chat/completions") {
+      res.end(JSON.stringify({ choices: [{ message: { content: "smoke-ok" } }] }));
+    } else if (req.url === "/gateway" || req.url?.startsWith("/gateway/")) {
+      res.end("<html>openclaw-app</html>");
+    } else if (req.url === "/api/firewall") {
+      res.end(JSON.stringify({ mode: "learning", allowlist: [] }));
+    } else if (req.url === "/api/channels/summary") {
+      res.end(JSON.stringify({ slack: { connected: true, lastError: null }, telegram: null, discord: null, whatsapp: null }));
+    } else if (req.url === "/api/admin/ssh") {
+      res.end(JSON.stringify({ stdout: "smoke-ok\n", stderr: "", exitCode: 0 }));
+    } else if (req.url === "/api/admin/ensure") {
+      res.end(JSON.stringify({ state: "running" }));
+    } else if (req.url === "/api/admin/channel-secrets") {
+      res.end(JSON.stringify({ configured: true, sent: true, status: 200 }));
+    } else {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "not found" }));
+    }
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address() as import("node:net").AddressInfo;
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const result = await runCli(["--base-url", baseUrl, "--profile", "wake", "--timeout", "5"]);
+    assert.equal(result.code, 0, `Expected exit 0, got ${result.code}. stderr: ${result.stderr}`);
+    const report = JSON.parse(result.stdout);
+    const names = report.phases.map((p: PhaseResult) => p.phase);
+    assert.ok(names.includes("channelWakeFromSleep"));
+    assert.ok(!names.some((name: string) => name.startsWith("selfHealTokenRefresh")));
   } finally {
     server.close();
   }

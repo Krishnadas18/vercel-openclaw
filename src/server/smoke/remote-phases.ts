@@ -170,16 +170,25 @@ export interface ResponseClassification {
   hint: string;
 }
 
-/** Detect login/sign-in pages returned as 200 instead of the expected content. */
+/** Detect Vercel Deployment Protection pages before app-level auth. */
+function looksLikeVercelProtectionPage(body: string): boolean {
+  const lower = body.toLowerCase();
+  return (
+    lower.includes("__vercel_auth") ||
+    lower.includes("authentication required") ||
+    lower.includes("x-vercel-protection-bypass") ||
+    lower.includes("sign in with vercel")
+  );
+}
+
+/** Detect app login/sign-in pages returned as 200 instead of expected content. */
 function looksLikeLoginPage(body: string): boolean {
   const lower = body.toLowerCase();
   return (
-    (lower.includes("<form") &&
-      (lower.includes("login") ||
-        lower.includes("sign in") ||
-        lower.includes("password"))) ||
-    lower.includes("sign in with vercel") ||
-    lower.includes("__vercel_auth")
+    lower.includes("<form") &&
+    (lower.includes("login") ||
+      lower.includes("sign in") ||
+      lower.includes("password"))
   );
 }
 
@@ -195,10 +204,17 @@ export function classifyResponse(
   headers?: { get(name: string): string | null },
 ): ResponseClassification | null {
   if (status === 401 || status === 403) {
+    if (looksLikeVercelProtectionPage(bodyText)) {
+      return {
+        errorCode: "EDGE_BYPASS_FAILED",
+        error: `Vercel Deployment Protection blocked the request (HTTP ${status})`,
+        hint: "Set VERCEL_AUTOMATION_BYPASS_SECRET for the target Vercel project or verify it with vercel curl",
+      };
+    }
     return {
-      errorCode: "AUTH_FAILED",
-      error: `Authentication failed (HTTP ${status})`,
-      hint: "Set SMOKE_AUTH_COOKIE or check deployment protection settings",
+      errorCode: "APP_AUTH_FAILED",
+      error: `OpenClaw app authentication failed (HTTP ${status})`,
+      hint: "Set SMOKE_ADMIN_SECRET or ADMIN_SECRET for admin-secret mode, or SMOKE_AUTH_COOKIE for sign-in-with-vercel mode",
     };
   }
 
@@ -211,11 +227,19 @@ export function classifyResponse(
     };
   }
 
+  if (looksLikeVercelProtectionPage(bodyText)) {
+    return {
+      errorCode: "EDGE_BYPASS_FAILED",
+      error: "Response is the Vercel Deployment Protection authentication page, not the expected content",
+      hint: "Set VERCEL_AUTOMATION_BYPASS_SECRET for the target Vercel project or verify it with vercel curl",
+    };
+  }
+
   if (looksLikeLoginPage(bodyText)) {
     return {
-      errorCode: "LOGIN_PAGE",
-      error: "Response is a login/sign-in page, not the expected content",
-      hint: "Set SMOKE_AUTH_COOKIE — the endpoint requires authentication",
+      errorCode: "APP_AUTH_FAILED",
+      error: "Response is an app login/sign-in page, not the expected content",
+      hint: "Set SMOKE_ADMIN_SECRET or ADMIN_SECRET for admin-secret mode, or SMOKE_AUTH_COOKIE for sign-in-with-vercel mode",
     };
   }
 
@@ -626,6 +650,18 @@ async function fetchChannelSummary(
   }
 }
 
+type WakeChannel = "slack" | "telegram" | "whatsapp";
+
+function selectWakeChannel(
+  summary: Record<string, { connected?: boolean } | null> | null,
+): WakeChannel | null {
+  if (!summary) return null;
+  for (const channel of ["slack", "telegram", "whatsapp"] as const) {
+    if (summary[channel]?.connected === true) return channel;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Channel round-trip phase (tests webhook → queue → drain → completions)
 // ---------------------------------------------------------------------------
@@ -784,25 +820,10 @@ export async function channelWakeFromSleep(
   let configuredByUs = false;
 
   try {
-    // 1. Probe which wake-capable channels are configured.
-    const wakeProbeOrder = [
-      { channel: "slack" as const, probeBody: "{}" },
-      { channel: "telegram" as const, probeBody: "{}" },
-      { channel: "whatsapp" as const, probeBody: "{}" },
-    ];
+    // 1. Read channel configuration without delivering fake webhooks.
+    let wakeChannel = selectWakeChannel(await fetchChannelSummary(baseUrl, reqTimeout));
 
-    let wakeChannel: "slack" | "telegram" | "whatsapp" | null = null;
-    let probeResults = await Promise.all(
-      wakeProbeOrder.map(async ({ channel, probeBody }) => ({
-        channel,
-        result: await sendSmokeWebhook(baseUrl, channel, probeBody, reqTimeout),
-      })),
-    );
-
-    const configuredProbe = probeResults.find((entry) => entry.result?.configured);
-    if (configuredProbe) {
-      wakeChannel = configuredProbe.channel;
-    } else {
+    if (!wakeChannel) {
       // Auto-configure test channels
       log(phase, "auto-configuring", { reason: "no-wake-channel-configured" });
       const configured = await configureTestChannels(baseUrl, reqTimeout);
@@ -814,21 +835,14 @@ export async function channelWakeFromSleep(
         };
       }
       configuredByUs = true;
-      probeResults = await Promise.all(
-        wakeProbeOrder.map(async ({ channel, probeBody }) => ({
-          channel,
-          result: await sendSmokeWebhook(baseUrl, channel, probeBody, reqTimeout),
-        })),
-      );
-      const configuredAfterAuto = probeResults.find((entry) => entry.result?.configured);
-      if (!configuredAfterAuto) {
+      wakeChannel = selectWakeChannel(await fetchChannelSummary(baseUrl, reqTimeout));
+      if (!wakeChannel) {
         log(phase, "skipped", { reason: "still-not-configured-after-auto" });
         return {
           phase, passed: true, durationMs: 0, endpoint,
           detail: { skipped: true, reason: "Wake-capable channels still not configured after auto-configure" },
         };
       }
-      wakeChannel = configuredAfterAuto.channel;
     }
 
     const t0 = performance.now();

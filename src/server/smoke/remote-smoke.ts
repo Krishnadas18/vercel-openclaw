@@ -31,8 +31,10 @@ import {
   restoreFromSnapshot as _restoreFromSnapshot,
   selfHealTokenRefresh,
 } from "./remote-phases.js";
-import { setAuthCookie, setProtectionBypass, getAuthSource } from "./remote-auth.js";
+import { setAdminSecret, setAuthCookie, setProtectionBypass, getAuthSource } from "./remote-auth.js";
 import { emitEvent } from "./log.js";
+
+type SmokeProfile = "safe" | "wake" | "full";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -55,6 +57,7 @@ function parseCliArgs(): {
   timeoutMs: number;
   requestTimeoutMs: number;
   jsonOnly: boolean;
+  profile: SmokeProfile;
 } {
   const { values } = parseArgs({
     options: {
@@ -63,7 +66,9 @@ function parseCliArgs(): {
       timeout: { type: "string", default: "120" },
       "request-timeout": { type: "string", default: "30" },
       "auth-cookie": { type: "string" },
+      "admin-secret": { type: "string" },
       "protection-bypass": { type: "string" },
+      profile: { type: "string" },
       "json-only": { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
@@ -79,19 +84,28 @@ Options:
   --timeout <seconds>     Timeout in seconds for polling phases (default: 120).
   --request-timeout <s>   Per-request fetch timeout in seconds (default: 30).
   --auth-cookie <value>   Auth cookie (overrides SMOKE_AUTH_COOKIE env var).
+  --admin-secret <value>  Admin bearer secret (overrides SMOKE_ADMIN_SECRET/ADMIN_SECRET).
   --protection-bypass <s> Vercel deployment protection bypass secret
                           (overrides VERCEL_AUTOMATION_BYPASS_SECRET env var).
+  --profile <name>        safe, wake, or full. Defaults to safe, or full with --destructive.
   --json-only             Suppress human-readable stderr; emit only JSON to stdout.
   --help                  Show this help message.
 
 Environment:
   SMOKE_AUTH_COOKIE                  Encrypted session cookie for sign-in-with-vercel mode.
+  SMOKE_ADMIN_SECRET                 Admin bearer secret for admin-secret mode.
+  ADMIN_SECRET                       Fallback admin bearer secret for admin-secret mode.
   VERCEL_AUTOMATION_BYPASS_SECRET    Deployment protection bypass secret.`);
     process.exit(0);
   }
 
   if (!values["base-url"]) {
     console.error("error: --base-url is required");
+    process.exit(1);
+  }
+
+  if (values["base-url"].includes("x-vercel-protection-bypass")) {
+    console.error("error: --base-url must not include x-vercel-protection-bypass; use --protection-bypass or VERCEL_AUTOMATION_BYPASS_SECRET");
     process.exit(1);
   }
 
@@ -111,8 +125,17 @@ Environment:
   if (values["auth-cookie"]) {
     setAuthCookie(values["auth-cookie"]);
   }
+  if (values["admin-secret"]) {
+    setAdminSecret(values["admin-secret"]);
+  }
   if (values["protection-bypass"]) {
     setProtectionBypass(values["protection-bypass"]);
+  }
+
+  const profile = values.profile ?? (values.destructive ? "full" : "safe");
+  if (profile !== "safe" && profile !== "wake" && profile !== "full") {
+    console.error("error: --profile must be one of: safe, wake, full");
+    process.exit(1);
   }
 
   return {
@@ -121,6 +144,7 @@ Environment:
     timeoutMs: timeoutSec * 1000,
     requestTimeoutMs: requestTimeoutSec * 1000,
     jsonOnly: values["json-only"] ?? false,
+    profile,
   };
 }
 
@@ -130,7 +154,7 @@ Environment:
 
 type PhaseFn = (baseUrl: string, timeoutMs: number, requestTimeoutMs: number) => Promise<PhaseResult>;
 
-function buildPhaseList(destructive: boolean): PhaseFn[] {
+function buildPhaseList(profile: SmokeProfile): PhaseFn[] {
   const safe: PhaseFn[] = [
     (b, _t, r) => health(b, { requestTimeoutMs: r }),
     (b, _t, r) => status(b, { requestTimeoutMs: r }),
@@ -145,7 +169,16 @@ function buildPhaseList(destructive: boolean): PhaseFn[] {
     (b, t, _r) => channelRoundTrip(b, { requestTimeoutMs: 30_000, pollTimeoutMs: t }),
   ];
 
-  if (!destructive) return safe;
+  if (profile === "safe") return safe;
+
+  const wake: PhaseFn[] = [
+    (b, t, r) => ensureRunning(b, t, { requestTimeoutMs: r }),
+    (b, _t, _r) => chatCompletions(b, { requestTimeoutMs: 60_000 }),
+    (b, t, _r) => channelWakeFromSleep(b, t, { requestTimeoutMs: 30_000 }),
+    (b, _t, _r) => chatCompletions(b, { requestTimeoutMs: 60_000 }),
+  ];
+
+  if (profile === "wake") return [...safe, ...wake];
 
   const destroy: PhaseFn[] = [
     // Ensure sandbox is running for initial tests
@@ -235,7 +268,7 @@ function printSummary(report: SmokeReport): void {
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const { baseUrl, destructive, timeoutMs, requestTimeoutMs, jsonOnly } = parseCliArgs();
+  const { baseUrl, destructive, timeoutMs, requestTimeoutMs, jsonOnly, profile } = parseCliArgs();
 
   // Structured event: smoke-start (always emitted)
   emitEvent({
@@ -243,12 +276,13 @@ async function main(): Promise<void> {
     timestamp: new Date().toISOString(),
     baseUrl,
     destructive,
+    profile,
     timeoutMs,
     requestTimeoutMs,
     authSource: getAuthSource(),
   });
 
-  const phases = buildPhaseList(destructive);
+  const phases = buildPhaseList(profile);
   const report = await runPhases(baseUrl, timeoutMs, requestTimeoutMs, phases, jsonOnly);
 
   // Structured event: smoke-finish (always emitted)

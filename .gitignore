@@ -50,3 +50,4 @@ next-env.d.ts
 .codex
 .claude/
 bun.lock
+/lat.md/

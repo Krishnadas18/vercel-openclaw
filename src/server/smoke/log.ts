@@ -23,6 +23,7 @@ export interface SmokeStartEvent {
   timestamp: string;
   baseUrl: string;
   destructive: boolean;
+  profile: string;
   timeoutMs: number;
   requestTimeoutMs: number;
   authSource: string;

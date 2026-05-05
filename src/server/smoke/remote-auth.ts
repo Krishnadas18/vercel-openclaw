@@ -3,10 +3,11 @@
  *
  * - In `sign-in-with-vercel` mode: reads SMOKE_AUTH_COOKIE from env
  *   (or accepts a CLI override) and attaches it as a Cookie header.
- * - In `admin-secret` mode: uses bearer token auth. If the deployment also
- *   has Vercel deployment protection, reads VERCEL_AUTOMATION_BYPASS_SECRET
- *   from env (or accepts a CLI override via --protection-bypass) and sends
- *   the `x-vercel-protection-bypass` header.
+ * - In `admin-secret` mode: reads SMOKE_ADMIN_SECRET or ADMIN_SECRET from env
+ *   (or accepts a CLI override) and attaches it as a bearer token.
+ * - If the deployment also has Vercel deployment protection, reads
+ *   VERCEL_AUTOMATION_BYPASS_SECRET from env (or accepts a CLI override via
+ *   --protection-bypass) and sends the `x-vercel-protection-bypass` header.
  */
 
 /** Module-level cookie override set by the CLI via `setAuthCookie()`. */
@@ -14,6 +15,9 @@ let _cookieOverride: string | undefined;
 
 /** Module-level bypass secret override set by the CLI via `setProtectionBypass()`. */
 let _bypassOverride: string | undefined;
+
+/** Module-level admin secret override set by the CLI via `setAdminSecret()`. */
+let _adminSecretOverride: string | undefined;
 
 /**
  * Set an explicit auth cookie value. Takes precedence over SMOKE_AUTH_COOKIE env var.
@@ -34,14 +38,28 @@ export function setProtectionBypass(value: string | undefined): void {
 }
 
 /**
+ * Set an explicit admin secret. Takes precedence over SMOKE_ADMIN_SECRET and
+ * ADMIN_SECRET env vars. Used by the CLI when `--admin-secret` is supplied.
+ */
+export function setAdminSecret(value: string | undefined): void {
+  _adminSecretOverride = value;
+}
+
+/**
  * Return which auth source is active, for diagnostics.
  */
 export function getAuthSource(): string {
-  if (_cookieOverride) return "cli-cookie";
-  if (process.env.SMOKE_AUTH_COOKIE) return "env-cookie";
-  if (_bypassOverride) return "cli-bypass";
-  if (process.env.VERCEL_AUTOMATION_BYPASS_SECRET) return "env-bypass";
-  return "none";
+  const parts: string[] = [];
+  if (_bypassOverride || process.env.VERCEL_AUTOMATION_BYPASS_SECRET) {
+    parts.push("edge-bypass");
+  }
+  if (_adminSecretOverride || process.env.SMOKE_ADMIN_SECRET || process.env.ADMIN_SECRET) {
+    parts.push("admin-secret");
+  }
+  if (_cookieOverride || process.env.SMOKE_AUTH_COOKIE) {
+    parts.push("cookie");
+  }
+  return parts.length ? parts.join("+") : "none";
 }
 
 /**
@@ -62,6 +80,11 @@ export function authHeaders(
   const bypass = _bypassOverride ?? process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
   if (bypass) {
     headers["x-vercel-protection-bypass"] = bypass;
+  }
+
+  const adminSecret = _adminSecretOverride ?? process.env.SMOKE_ADMIN_SECRET ?? process.env.ADMIN_SECRET;
+  if (adminSecret) {
+    headers.Authorization = `Bearer ${adminSecret}`;
   }
 
   if (opts.mutation) {
