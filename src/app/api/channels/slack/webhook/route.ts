@@ -22,7 +22,7 @@ import {
 } from "@/server/channels/slack/adapter";
 import { extractRequestId, logInfo, logWarn } from "@/server/log";
 import { createOperationContext, withOperationContext } from "@/server/observability/operation-context";
-import { getSandboxDomain, reconcileStaleRunningStatus } from "@/server/sandbox/lifecycle";
+import { getSandboxDomain, probeGatewayReady, reconcileSandboxHealth, reconcileStaleRunningStatus } from "@/server/sandbox/lifecycle";
 import { getInitializedMeta, getStore } from "@/server/store/store";
 const SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage";
 const SLACK_BOOT_MESSAGE_TIMEOUT_MS = 5_000;
@@ -445,50 +445,78 @@ export async function POST(request: Request): Promise<Response> {
         op,
       });
 
-      logInfo("channels.slack_fast_path_forwarding", withOperationContext(op, {
-        sandboxId: effectiveMeta.sandboxId,
-        forwardUrl,
-        forwardHeaderKeys: Object.keys(forwardHeaders),
-        hasSlackSignature: Boolean(forwardHeaders["x-slack-signature"]),
-        hasSlackTimestamp: Boolean(forwardHeaders["x-slack-request-timestamp"]),
-        ...eventInfo,
-      }));
-
-      const resp = await fetch(forwardUrl, {
-        method: "POST",
-        headers: forwardHeaders,
-        body: rawBody,
-        signal: AbortSignal.timeout(SLACK_FAST_PATH_FORWARD_TIMEOUT_MS),
-      });
-      if (resp.ok) {
-        logInfo("channels.slack_fast_path_ok", withOperationContext(op, {
+      const readiness = await probeGatewayReady({ timeoutMs: 1_000 });
+      if (!readiness.ready) {
+        const health = await reconcileSandboxHealth({
+          origin: getPublicOrigin(request),
+          reason: "channel:slack-fast-path",
+          op,
+        });
+        effectiveMeta = health.meta;
+        logWarn("channels.slack_fast_path_gateway_not_ready", withOperationContext(op, {
           sandboxId: effectiveMeta.sandboxId,
-          responseStatus: resp.status,
+          action: "reconcile_and_wake",
+          statusCode: readiness.statusCode,
+          markerFound: readiness.markerFound,
+          probeError: readiness.error,
+          healthStatus: health.status,
+          repaired: health.repaired,
+          healthError: health.error,
           ...eventInfo,
         }));
-        return Response.json({ ok: true });
-      }
-
-      // Native handler returned non-2xx — fall through to workflow wake path
-      // so the event is not silently dropped. Slack does not retry on our 200.
-      // Distinguish gateway errors (502/503/504, sandbox unreachable) from
-      // other non-2xx (handler may already be processing) for log triage.
-      const slackFallbackIsGatewayError =
-        resp.status === 502 || resp.status === 503 || resp.status === 504;
-      logWarn(
-        slackFallbackIsGatewayError
-          ? "channels.slack_fast_path_gateway_error"
-          : "channels.slack_fast_path_fallback_to_workflow",
-        withOperationContext(op, {
-          status: resp.status,
+      } else {
+        logInfo("channels.slack_fast_path_gateway_ready", withOperationContext(op, {
           sandboxId: effectiveMeta.sandboxId,
-          action: slackFallbackIsGatewayError
-            ? "reconcile_and_wake"
-            : "start_drain_channel_workflow",
+          statusCode: readiness.statusCode,
+          markerFound: readiness.markerFound,
           ...eventInfo,
-        }),
-      );
-      effectiveMeta = await reconcileStaleRunningStatus();
+        }));
+
+        logInfo("channels.slack_fast_path_forwarding", withOperationContext(op, {
+          sandboxId: effectiveMeta.sandboxId,
+          forwardUrl,
+          forwardHeaderKeys: Object.keys(forwardHeaders),
+          hasSlackSignature: Boolean(forwardHeaders["x-slack-signature"]),
+          hasSlackTimestamp: Boolean(forwardHeaders["x-slack-request-timestamp"]),
+          ...eventInfo,
+        }));
+
+        const resp = await fetch(forwardUrl, {
+          method: "POST",
+          headers: forwardHeaders,
+          body: rawBody,
+          signal: AbortSignal.timeout(SLACK_FAST_PATH_FORWARD_TIMEOUT_MS),
+        });
+        if (resp.ok) {
+          logInfo("channels.slack_fast_path_ok", withOperationContext(op, {
+            sandboxId: effectiveMeta.sandboxId,
+            responseStatus: resp.status,
+            ...eventInfo,
+          }));
+          return Response.json({ ok: true });
+        }
+
+        // Native handler returned non-2xx — fall through to workflow wake path
+        // so the event is not silently dropped. Slack does not retry on our 200.
+        // Distinguish gateway errors (502/503/504, sandbox unreachable) from
+        // other non-2xx (handler may already be processing) for log triage.
+        const slackFallbackIsGatewayError =
+          resp.status === 502 || resp.status === 503 || resp.status === 504;
+        logWarn(
+          slackFallbackIsGatewayError
+            ? "channels.slack_fast_path_gateway_error"
+            : "channels.slack_fast_path_fallback_to_workflow",
+          withOperationContext(op, {
+            status: resp.status,
+            sandboxId: effectiveMeta.sandboxId,
+            action: slackFallbackIsGatewayError
+              ? "reconcile_and_wake"
+              : "start_drain_channel_workflow",
+            ...eventInfo,
+          }),
+        );
+        effectiveMeta = await reconcileStaleRunningStatus();
+      }
     } catch (error) {
       // Network-level failure or AbortSignal timeout — native handler
       // may or may not have received the payload. Reconcile stale

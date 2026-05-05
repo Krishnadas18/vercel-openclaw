@@ -12,6 +12,8 @@
  *
  *   - Gateway-error fallback: forward returns 502.
  *   - Network-error fallback: forward throws (TimeoutError or fetch reject).
+ *   - Empty platform 200 fallback: gateway probe lacks the OpenClaw marker,
+ *     so the route must not forward to the sandbox catch-all.
  *
  * Both must end with: response 200, workflow.start called exactly once,
  * fast-path forward attempted exactly once.
@@ -33,7 +35,7 @@ import {
   buildSignedSlackRequest,
   buildSlackAppMentionPayload,
 } from "@/test-utils/host-smoke/slack-events";
-import { slackOkResponse } from "@/test-utils/fake-fetch";
+import { gatewayNotReadyResponse, gatewayReadyResponse, slackOkResponse } from "@/test-utils/fake-fetch";
 
 const SLACK_SIGNING_SECRET = "test-slack-signing-secret-l4-stale";
 const CHANNEL_ID = "C0L4STALE";
@@ -68,6 +70,7 @@ test("L4-host fast-path stale: 502 from forward triggers fallback to workflow", 
   await withHarness(async (h) => {
     await configureRunningSandboxWithSlack(h);
 
+    h.fakeFetch.onGet(SANDBOX_URL_3000, () => gatewayReadyResponse());
     h.fakeFetch.onPost(/\/slack\/events$/, () => new Response("bad gateway", { status: 502 }));
     // Boot message + any other Slack outbound during fallback.
     h.fakeFetch.onPost(/slack\.com\/api\//, () => slackOkResponse());
@@ -103,6 +106,7 @@ test("L4-host fast-path stale: network error from forward triggers fallback to w
   await withHarness(async (h) => {
     await configureRunningSandboxWithSlack(h);
 
+    h.fakeFetch.onGet(SANDBOX_URL_3000, () => gatewayReadyResponse());
     h.fakeFetch.onPost(/\/slack\/events$/, () => {
       throw new Error("ECONNREFUSED simulated for stale sandbox");
     });
@@ -127,6 +131,44 @@ test("L4-host fast-path stale: network error from forward triggers fallback to w
         startMock.mock.callCount(),
         1,
         "network-error fast-path must fall through to durable workflow",
+      );
+      resetAfterCallbacks();
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
+
+test("L4-host fast-path stale: empty platform 200 does not drop Slack event", async () => {
+  await withHarness(async (h) => {
+    await configureRunningSandboxWithSlack(h);
+
+    h.fakeFetch.onGet(SANDBOX_URL_3000, () => gatewayNotReadyResponse());
+    h.fakeFetch.onPost(/\/slack\/events$/, () =>
+      new Response("", { status: 200 }),
+    );
+    h.fakeFetch.onPost(/slack\.com\/api\//, () => slackOkResponse());
+
+    const route = getSlackWebhookRoute();
+    const startMock = mock.method(slackWebhookWorkflowRuntime, "start", async () => {});
+    try {
+      const req = buildSignedSlackRequest({
+        signingSecret: SLACK_SIGNING_SECRET,
+        payload: buildSlackAppMentionPayload({ channelId: CHANNEL_ID }),
+      });
+      const result = await callRoute(route.POST, req);
+
+      assert.equal(result.status, 200, "platform 200 must not be treated as native delivery");
+      assert.equal(
+        fastPathForwardAttempts(h),
+        0,
+        "route must skip native forward when gateway marker probe fails",
+      );
+      assert.equal(
+        startMock.mock.callCount(),
+        1,
+        "gateway-marker failure must fall through to durable workflow",
       );
       resetAfterCallbacks();
     } finally {

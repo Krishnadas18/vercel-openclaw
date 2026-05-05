@@ -31,6 +31,7 @@ import {
 import { slackWebhookWorkflowRuntime } from "@/app/api/channels/slack/webhook/route";
 import { _setAiGatewayTokenOverrideForTesting } from "@/server/env";
 import { getServerLogs, _resetLogBuffer } from "@/server/log";
+import { gatewayReadyResponse } from "@/test-utils/fake-fetch";
 
 const SLACK_SIGNING_SECRET = "test-slack-signing-secret-direct";
 
@@ -350,6 +351,7 @@ test("Slack webhook: fast path non-ok response falls through to workflow wake pa
       };
     });
 
+    h.fakeFetch.onGet("https://sbx-slack-non-ok-3000.fake.vercel.run", () => gatewayReadyResponse());
     h.fakeFetch.onPost(/slack\/events$/, () =>
       new Response("bad gateway", { status: 502 }),
     );
@@ -392,6 +394,7 @@ test("Slack webhook: fast path refreshes AI Gateway token before native forward"
     });
     await h.controller.get({ sandboxId: "sbx-slack-token-refresh" });
 
+    h.fakeFetch.onGet("https://sbx-slack-token-refresh-3000.fake.vercel.run", () => gatewayReadyResponse());
     let networkPolicyCountAtForward = -1;
     h.fakeFetch.onPost(/slack\/events$/, () => {
       networkPolicyCountAtForward =
@@ -447,6 +450,7 @@ test("Slack webhook: fast path token refresh failure logs and still forwards", a
       throw new Error("network policy unavailable");
     };
 
+    h.fakeFetch.onGet("https://sbx-slack-token-refresh-fails-3000.fake.vercel.run", () => gatewayReadyResponse());
     let forwarded = false;
     h.fakeFetch.onPost(/slack\/events$/, () => {
       forwarded = true;
