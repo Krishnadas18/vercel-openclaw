@@ -19,6 +19,7 @@ import {
   OPENCLAW_LOG_FILE,
   OPENCLAW_STARTUP_SCRIPT_PATH,
   OPENCLAW_STATE_DIR,
+  OPENCLAW_WORKSPACE_TEMPLATES_DIR,
 } from "@/server/openclaw/config";
 import {
   buildOpenClawInstallPatchScript,
@@ -133,8 +134,8 @@ export async function setupOpenClaw(
           // Workspace templates — agent runtime reads these at chat time
           // (AGENTS.md, IDENTITY.md, BOOT.md, etc.). Without them, every
           // chat request fails with "Missing workspace template".
-          `mkdir -p /home/vercel-sandbox/docs/reference`,
-          `curl -fsSL --max-time 15 --connect-timeout 5 ${JSON.stringify(new URL("workspace-templates.tar.gz", bundleUrl).href)} | tar xz -C /home/vercel-sandbox/docs/reference`,
+          `mkdir -p ${JSON.stringify(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`,
+          `curl -fsSL --max-time 15 --connect-timeout 5 ${JSON.stringify(new URL("workspace-templates.tar.gz", bundleUrl).href)} | tar xz -C ${JSON.stringify(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`,
           // auth-profiles.json — pre-seed the vercel-ai-gateway provider so
           // chat doesn't fail with "No API key found for provider". The
           // bundle doesn't include the vercel-ai-gateway extension at runtime,

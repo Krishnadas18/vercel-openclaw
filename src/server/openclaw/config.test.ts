@@ -32,9 +32,9 @@ import {
   buildReasoningScript,
   buildCompareSkill,
 	buildCompareScript,
-	OPENCLAW_BUNDLE_PATH,
-	OPENCLAW_BUNDLED_PLUGINS_DIR_PATH,
-	OPENCLAW_FORCE_PAIR_SCRIPT_PATH,
+  OPENCLAW_BUNDLE_PATH,
+  OPENCLAW_BUNDLED_PLUGINS_DIR_PATH,
+  OPENCLAW_FORCE_PAIR_SCRIPT_PATH,
   OPENCLAW_STATE_DIR,
   OPENCLAW_TELEGRAM_WEBHOOK_HOST,
   OPENCLAW_TELEGRAM_INTERNAL_WEBHOOK_PATH,
@@ -330,6 +330,21 @@ test("buildGatewayRestartScript kills existing gateway and relaunches it", () =>
   assert.ok(script.includes("openclaw") && script.includes("kill"), "restart script should kill existing gateway");
   assert.ok(script.includes("setsid"), "restart script should relaunch via setsid");
   assert.ok(script.includes("gateway --port 3000 --bind loopback"), "restart script should launch the gateway");
+});
+
+test("gateway launch scripts do not select a non-existent none harness", () => {
+  assert.ok(
+    !buildStartupScript().includes("OPENCLAW_AGENT_RUNTIME=\"none\""),
+    "startup must not export OPENCLAW_AGENT_RUNTIME=none",
+  );
+  assert.ok(
+    !buildGatewayRestartScript().includes("OPENCLAW_AGENT_RUNTIME=\"none\""),
+    "restart must not export OPENCLAW_AGENT_RUNTIME=none",
+  );
+  assert.ok(
+    !buildFastRestoreScript().includes("OPENCLAW_AGENT_RUNTIME=\"none\""),
+    "fast restore must not export OPENCLAW_AGENT_RUNTIME=none",
+  );
 });
 
 test("buildStartupScript launches gateway via shell", () => {

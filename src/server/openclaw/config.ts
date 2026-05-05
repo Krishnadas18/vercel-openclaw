@@ -6,6 +6,8 @@ const OPENCLAW_PORT = 3000;
 export const OPENCLAW_BIN = "/home/vercel-sandbox/.global/npm/bin/openclaw";
 export const OPENCLAW_BUNDLE_PATH = "/home/vercel-sandbox/openclaw.bundle.mjs";
 export const OPENCLAW_BUNDLE_CMD = `node ${OPENCLAW_BUNDLE_PATH}`;
+export const OPENCLAW_RUNTIME_WORKDIR = "/vercel/sandbox";
+export const OPENCLAW_WORKSPACE_TEMPLATES_DIR = `${OPENCLAW_RUNTIME_WORKDIR}/docs/reference`;
 // In bundle mode the gateway has no extensions/ tree to discover, so channel
 // plugins (slack/telegram/discord/whatsapp/...) ship as a sibling tarball
 // extracted here. The bundle's plugin discovery code reads
@@ -162,9 +164,6 @@ function buildGatewayEnvShell(): string {
     // time out, blocking Telegram/Slack startup by 28+ seconds.  Restricting
     // discovery to the single provider we use eliminates the delay.
     'export OPENCLAW_TEST_ONLY_PROVIDER_PLUGIN_IDS="vercel-ai-gateway"',
-    // Skip prewarmConfiguredPrimaryModel — sandbox network isn't ready
-    // during early boot, causing a 17s model discovery timeout.
-    'export OPENCLAW_AGENT_RUNTIME="none"',
     'export OPENCLAW_DISABLE_BONJOUR="1"',
     // Bundle-mode plugin discovery: point the loader at the extracted
     // channels tarball. Harmless in npm-install mode (the directory simply
@@ -830,14 +829,6 @@ export OPENCLAW_GATEWAY_PORT="${OPENCLAW_PORT}"
 export OPENCLAW_GATEWAY_TOKEN="\$gateway_token"
 export OPENAI_BASE_URL="https://ai-gateway.vercel.sh/v1"
 export OPENCLAW_TEST_ONLY_PROVIDER_PLUGIN_IDS="vercel-ai-gateway"
-# Skip prewarmConfiguredPrimaryModel on startup.  This function discovers
-# model providers before channel startup, but the sandbox network stack
-# isn't ready for outbound connections during the first ~15s of boot.
-# The discovery fetch hangs until timeout, blocking Telegram/Slack
-# handler registration.  Setting OPENCLAW_AGENT_RUNTIME=none makes the
-# prewarm return immediately.  Chat completions are unaffected — they
-# resolve the model at request time, not at startup.
-	export OPENCLAW_AGENT_RUNTIME="none"
 	export OPENCLAW_BUNDLED_PLUGINS_DIR="${OPENCLAW_BUNDLED_PLUGINS_DIR_PATH}"
 	chmod +x "${OPENCLAW_DIAG_SCRIPT_PATH}" 2>/dev/null || true
 ${buildNetLearnWriteShell()}

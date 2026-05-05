@@ -35,6 +35,7 @@ import {
   OPENCLAW_WORKER_SANDBOX_SCRIPT_PATH,
   OPENCLAW_STARTUP_SCRIPT_PATH,
   OPENCLAW_STATE_DIR,
+  OPENCLAW_WORKSPACE_TEMPLATES_DIR,
 } from "@/server/openclaw/config";
 import { setupOpenClaw, waitForGatewayReady, detectDrift, CommandFailedError } from "@/server/openclaw/bootstrap";
 import { getOpenclawPackageSpec } from "@/server/env";
@@ -51,6 +52,26 @@ import {
 async function createHandle(h: ReturnType<typeof createScenarioHarness>) {
   await h.controller.create({ ports: [3000] });
   return h.controller.lastCreated()!;
+}
+
+async function withEnv<T>(
+  overrides: Record<string, string | undefined>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const originals: Record<string, string | undefined> = {};
+  for (const key of Object.keys(overrides)) {
+    originals[key] = process.env[key];
+    if (overrides[key] === undefined) delete process.env[key];
+    else process.env[key] = overrides[key];
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of Object.entries(originals)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +188,35 @@ test("setupOpenClaw executes commands in correct order", async () => {
   } finally {
     h.teardown();
   }
+});
+
+test("setupOpenClaw extracts bundle workspace templates into runtime working tree", async () => {
+  await withEnv({ OPENCLAW_BUNDLE_URL: "https://example.test/openclaw.bundle.mjs" }, async () => {
+    const h = createScenarioHarness();
+    try {
+      const handle = await createHandle(h);
+
+      await setupOpenClaw(handle, {
+        gatewayToken: "tok-bundle",
+        proxyOrigin: "https://example.com",
+      });
+
+      const bundleDownload = handle.commands.find(
+        (c) => c.cmd === "bash" && c.args?.[1]?.includes("workspace-templates.tar.gz"),
+      );
+      assert.ok(bundleDownload, "bundle download command should fetch workspace templates");
+      assert.ok(
+        bundleDownload.args?.[1]?.includes(`mkdir -p ${JSON.stringify(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`),
+        "workspace template directory should match the bundle runtime working tree",
+      );
+      assert.ok(
+        bundleDownload.args?.[1]?.includes(`tar xz -C ${JSON.stringify(OPENCLAW_WORKSPACE_TEMPLATES_DIR)}`),
+        "workspace templates should extract into the bundle runtime working tree",
+      );
+    } finally {
+      h.teardown();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
