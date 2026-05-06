@@ -8,6 +8,7 @@ import {
 } from "@/server/channels/dedup";
 import { recordChannelDlqFailure } from "@/server/channels/dlq";
 import { refreshChannelFastPathGatewayToken } from "@/server/channels/fast-path-token";
+import { recordChannelLastForward } from "@/server/channels/last-forward";
 import { getPublicOrigin } from "@/server/public-url";
 import { channelDedupKey } from "@/server/channels/keys";
 import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-workflow";
@@ -20,7 +21,7 @@ import { deleteMessage, sendMessage } from "@/server/channels/telegram/bot-api";
 import { extractRequestId, logError, logInfo, logWarn } from "@/server/log";
 import { createOperationContext, withOperationContext } from "@/server/observability/operation-context";
 import { OPENCLAW_TELEGRAM_WEBHOOK_PORT } from "@/server/openclaw/config";
-import { getSandboxDomain, reconcileStaleRunningStatus } from "@/server/sandbox/lifecycle";
+import { getSandboxDomain, markSandboxPortUrlStale, reconcileStaleRunningStatus } from "@/server/sandbox/lifecycle";
 
 // The fast path awaits the native handler's full turn (including long
 // AI work like image generation). This timeout guards against wedged
@@ -226,10 +227,17 @@ export async function POST(request: Request): Promise<Response> {
     const telegramListenerReady =
       effectiveMeta.lastRestoreMetrics?.telegramListenerReady === true;
     if (effectiveMeta.status === "running" && effectiveMeta.sandboxId && telegramListenerReady) {
+      let portUrlStaleMarked = false;
+      let fastPathSandboxWebhookUrl: string | null = null;
+      const fastPathStartedAt = Date.now();
+      const fastPathUpdateIdForRecord = extractUpdateId(payload);
+      const fastPathDeliveryIdForRecord = fastPathUpdateIdForRecord
+        ? `telegram:${fastPathUpdateIdForRecord}`
+        : null;
       try {
         const sandboxWebhookUrl = await getSandboxDomain(OPENCLAW_TELEGRAM_WEBHOOK_PORT);
+        fastPathSandboxWebhookUrl = sandboxWebhookUrl;
         const forwardUrl = `${sandboxWebhookUrl}/telegram-webhook`;
-        const fastPathStartedAt = Date.now();
         await refreshChannelFastPathGatewayToken({
           channel: "telegram",
           requestId: requestId ?? null,
@@ -240,7 +248,7 @@ export async function POST(request: Request): Promise<Response> {
           "content-type": "application/json",
           "x-telegram-bot-api-secret-token": secretHeader,
         };
-        const fastPathUpdateId = extractUpdateId(payload);
+        const fastPathUpdateId = fastPathUpdateIdForRecord;
         if (fastPathUpdateId) {
           fastPathHeaders["x-openclaw-delivery-id"] = `telegram:${fastPathUpdateId}`;
         }
@@ -258,6 +266,20 @@ export async function POST(request: Request): Promise<Response> {
           fastPathDurationMs < 150 &&
           forwardBody.length === 0;
         if (forwardResponse.ok && !suspiciousEmpty200) {
+          await recordChannelLastForward("telegram", {
+            ok: true,
+            status: forwardResponse.status,
+            classification: "accepted",
+            attempts: 1,
+            totalMs: fastPathDurationMs,
+            transport: "public",
+            sandboxUrl: sandboxWebhookUrl,
+            sandboxId: effectiveMeta.sandboxId ?? null,
+            finalReasonHead: forwardBody.slice(0, 200),
+            startedAt: fastPathStartedAt,
+            completedAt: Date.now(),
+            deliveryId: `telegram:${fastPathUpdateId ?? "?"}`,
+          });
           logInfo("channels.telegram_fast_path_ok", withOperationContext(op, {
             sandboxId: effectiveMeta.sandboxId,
             forwardUrl,
@@ -283,12 +305,24 @@ export async function POST(request: Request): Promise<Response> {
                 forwardResponse.status === 504
               ? "gateway_error"
               : "non_ok";
+        // Classify the failure using the same rules as Slack so the
+        // forward outcome record is consistent across channels.
+        const isSandboxNotListening =
+          /^This sandbox is not listening/.test(forwardBody);
+        const fallbackClassification: string = isSandboxNotListening
+          ? "sandbox-not-listening"
+          : forwardResponse.status >= 502
+            ? "proxy-error"
+            : forwardResponse.status === 404
+              ? "handler-not-ready"
+              : "handler-error";
         logWarn(
           telegramFallbackReason === "gateway_error"
             ? "channels.telegram_fast_path_gateway_error"
             : "channels.telegram_fast_path_fallback_to_workflow",
           withOperationContext(op, {
             reason: telegramFallbackReason,
+            classification: fallbackClassification,
             status: forwardResponse.status,
             sandboxId: effectiveMeta.sandboxId,
             forwardUrl,
@@ -302,6 +336,35 @@ export async function POST(request: Request): Promise<Response> {
                 : "start_drain_channel_workflow",
           }),
         );
+        await recordChannelLastForward("telegram", {
+          ok: false,
+          status: forwardResponse.status,
+          classification: fallbackClassification,
+          attempts: 1,
+          totalMs: fastPathDurationMs,
+          transport: "public",
+          sandboxUrl: sandboxWebhookUrl,
+          sandboxId: effectiveMeta.sandboxId ?? null,
+          finalReasonHead: forwardBody.slice(0, 200),
+          startedAt: fastPathStartedAt,
+          completedAt: Date.now(),
+          deliveryId: fastPathDeliveryIdForRecord,
+        });
+        if (isSandboxNotListening && !portUrlStaleMarked) {
+          portUrlStaleMarked = true;
+          try {
+            await markSandboxPortUrlStale(
+              effectiveMeta.sandboxId ?? null,
+              OPENCLAW_TELEGRAM_WEBHOOK_PORT,
+              "fast-path-not-listening",
+            );
+          } catch (err) {
+            logWarn("channels.telegram_fast_path_port_url_refresh_failed", withOperationContext(op, {
+              error: err instanceof Error ? err.message : String(err),
+              sandboxId: effectiveMeta.sandboxId,
+            }));
+          }
+        }
         const staleMeta = effectiveMeta;
         effectiveMeta = await reconcileStaleRunningStatus();
         logInfo("channels.telegram_fast_path_reconciled", withOperationContext(op, {
@@ -318,8 +381,10 @@ export async function POST(request: Request): Promise<Response> {
         // longer than the fast-path budget.
         const isAbort =
           error instanceof Error && error.name === "TimeoutError";
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
         logWarn("channels.telegram_fast_path_failed", withOperationContext(op, {
-          error: error instanceof Error ? error.message : String(error),
+          error: errorMessage,
           errorName: error instanceof Error ? error.name : undefined,
           sandboxId: effectiveMeta.sandboxId,
           action: "reconcile_and_wake",
@@ -329,6 +394,20 @@ export async function POST(request: Request): Promise<Response> {
             ? TELEGRAM_FAST_PATH_FORWARD_TIMEOUT_MS
             : null,
         }));
+        await recordChannelLastForward("telegram", {
+          ok: false,
+          status: null,
+          classification: "fetch-exception",
+          attempts: 1,
+          totalMs: Date.now() - fastPathStartedAt,
+          transport: "public",
+          sandboxUrl: null,
+          sandboxId: effectiveMeta.sandboxId ?? null,
+          finalReasonHead: errorMessage,
+          startedAt: fastPathStartedAt,
+          completedAt: Date.now(),
+          deliveryId: fastPathDeliveryIdForRecord,
+        });
         const staleMeta = effectiveMeta;
         effectiveMeta = await reconcileStaleRunningStatus();
         logInfo("channels.telegram_fast_path_reconciled", withOperationContext(op, {
@@ -337,7 +416,21 @@ export async function POST(request: Request): Promise<Response> {
           reconciledStatus: effectiveMeta.status,
           reconciledSandboxId: effectiveMeta.sandboxId,
         }));
+        // suppress unused-var lint for sandbox URL when fetch never returned
+        void fastPathSandboxWebhookUrl;
       }
+    } else {
+      logInfo("channels.telegram_fast_path_skipped", withOperationContext(op, {
+        reason:
+          effectiveMeta.status !== "running"
+            ? `sandbox_status_${effectiveMeta.status}`
+            : !effectiveMeta.sandboxId
+              ? "no_sandbox_id"
+              : "listener_not_ready",
+        status: effectiveMeta.status,
+        sandboxId: effectiveMeta.sandboxId,
+        telegramListenerReady,
+      }));
     }
 
     // Send "Waking up" boot message from the webhook route (before workflow)

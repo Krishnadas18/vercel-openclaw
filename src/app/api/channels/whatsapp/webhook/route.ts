@@ -7,6 +7,7 @@ import {
 } from "@/server/channels/dedup";
 import { recordChannelDlqFailure } from "@/server/channels/dlq";
 import { refreshChannelFastPathGatewayToken } from "@/server/channels/fast-path-token";
+import { recordChannelLastForward } from "@/server/channels/last-forward";
 import { hasWhatsAppBusinessCredentials } from "@/shared/channels";
 import { getPublicOrigin } from "@/server/public-url";
 import { channelDedupKey } from "@/server/channels/keys";
@@ -15,7 +16,7 @@ import { sendMessage } from "@/server/channels/whatsapp/whatsapp-api";
 import { drainChannelWorkflow } from "@/server/workflows/channels/drain-channel-workflow";
 import { extractRequestId, logError, logInfo, logWarn } from "@/server/log";
 import { createOperationContext, withOperationContext } from "@/server/observability/operation-context";
-import { getSandboxDomain, reconcileStaleRunningStatus } from "@/server/sandbox/lifecycle";
+import { getSandboxDomain, markSandboxPortUrlStale, reconcileStaleRunningStatus } from "@/server/sandbox/lifecycle";
 import { getInitializedMeta, getStore } from "@/server/store/store";
 const WHATSAPP_FORWARD_HEADERS = [
   "x-hub-signature-256",
@@ -198,8 +199,12 @@ export async function POST(request: Request): Promise<Response> {
         forwardHeaders["x-openclaw-delivery-id"] = fastPathDeliveryId;
       }
 
+      const fastPathStartedAt = Date.now();
+      let fastPathSandboxUrl: string | null = null;
+      let portUrlStaleMarked = false;
       try {
         const sandboxUrl = await getSandboxDomain();
+        fastPathSandboxUrl = sandboxUrl;
         await refreshChannelFastPathGatewayToken({
           channel: "whatsapp",
           requestId: requestId ?? null,
@@ -213,6 +218,20 @@ export async function POST(request: Request): Promise<Response> {
           signal: AbortSignal.timeout(WHATSAPP_FAST_PATH_FORWARD_TIMEOUT_MS),
         });
         if (forwardResponse.ok) {
+          await recordChannelLastForward("whatsapp", {
+            ok: true,
+            status: forwardResponse.status,
+            classification: "accepted",
+            attempts: 1,
+            totalMs: Date.now() - fastPathStartedAt,
+            transport: "public",
+            sandboxUrl: fastPathSandboxUrl,
+            sandboxId: effectiveMeta.sandboxId ?? null,
+            finalReasonHead: null,
+            startedAt: fastPathStartedAt,
+            completedAt: Date.now(),
+            deliveryId: fastPathDeliveryId,
+          });
           logInfo("channels.whatsapp_fast_path_ok", withOperationContext(op, {
             sandboxId: effectiveMeta.sandboxId,
             deliveryId: fastPathDeliveryId,
@@ -220,18 +239,103 @@ export async function POST(request: Request): Promise<Response> {
           return Response.json({ ok: true });
         }
 
+        // Read the body once for classification + diagnostics. Cost is
+        // bounded — Vercel sandbox error pages are <500 bytes.
+        let respBodyHead: string | null = null;
+        try {
+          respBodyHead = (await forwardResponse.text()).slice(0, 200);
+        } catch {
+          /* response body already consumed or unreachable */
+        }
+        const isSandboxNotListening =
+          respBodyHead != null &&
+          /^This sandbox is not listening/.test(respBodyHead);
+        const classification: string = isSandboxNotListening
+          ? "sandbox-not-listening"
+          : forwardResponse.status === 502 ||
+              forwardResponse.status === 503 ||
+              forwardResponse.status === 504
+            ? "proxy-error"
+            : forwardResponse.status === 404
+              ? "handler-not-ready"
+              : "handler-error";
+
         if (forwardResponse.status === 502 || forwardResponse.status === 503 || forwardResponse.status === 504) {
           logWarn("channels.whatsapp_fast_path_gateway_error", withOperationContext(op, {
             sandboxId: effectiveMeta.sandboxId,
             status: forwardResponse.status,
+            classification,
+            sandboxUrl: fastPathSandboxUrl,
+            bodyHead: respBodyHead,
             action: "reconcile_and_wake",
           }));
+          await recordChannelLastForward("whatsapp", {
+            ok: false,
+            status: forwardResponse.status,
+            classification,
+            attempts: 1,
+            totalMs: Date.now() - fastPathStartedAt,
+            transport: "public",
+            sandboxUrl: fastPathSandboxUrl,
+            sandboxId: effectiveMeta.sandboxId ?? null,
+            finalReasonHead: respBodyHead,
+            startedAt: fastPathStartedAt,
+            completedAt: Date.now(),
+            deliveryId: fastPathDeliveryId,
+          });
+          if (isSandboxNotListening && !portUrlStaleMarked) {
+            portUrlStaleMarked = true;
+            try {
+              await markSandboxPortUrlStale(
+                effectiveMeta.sandboxId ?? null,
+                undefined,
+                "fast-path-not-listening",
+              );
+            } catch (err) {
+              logWarn("channels.whatsapp_fast_path_port_url_refresh_failed", withOperationContext(op, {
+                error: err instanceof Error ? err.message : String(err),
+                sandboxId: effectiveMeta.sandboxId,
+              }));
+            }
+          }
           effectiveMeta = await reconcileStaleRunningStatus();
         } else {
           logWarn("channels.whatsapp_fast_path_non_ok", withOperationContext(op, {
             sandboxId: effectiveMeta.sandboxId,
             status: forwardResponse.status,
+            classification,
+            sandboxUrl: fastPathSandboxUrl,
+            bodyHead: respBodyHead,
           }));
+          await recordChannelLastForward("whatsapp", {
+            ok: false,
+            status: forwardResponse.status,
+            classification,
+            attempts: 1,
+            totalMs: Date.now() - fastPathStartedAt,
+            transport: "public",
+            sandboxUrl: fastPathSandboxUrl,
+            sandboxId: effectiveMeta.sandboxId ?? null,
+            finalReasonHead: respBodyHead,
+            startedAt: fastPathStartedAt,
+            completedAt: Date.now(),
+            deliveryId: fastPathDeliveryId,
+          });
+          if (isSandboxNotListening && !portUrlStaleMarked) {
+            portUrlStaleMarked = true;
+            try {
+              await markSandboxPortUrlStale(
+                effectiveMeta.sandboxId ?? null,
+                undefined,
+                "fast-path-not-listening",
+              );
+            } catch (err) {
+              logWarn("channels.whatsapp_fast_path_port_url_refresh_failed", withOperationContext(op, {
+                error: err instanceof Error ? err.message : String(err),
+                sandboxId: effectiveMeta.sandboxId,
+              }));
+            }
+          }
           return Response.json({ ok: true });
         }
       } catch (error) {
@@ -240,9 +344,11 @@ export async function POST(request: Request): Promise<Response> {
         // fall through to workflow wake path.
         const isAbort =
           error instanceof Error && error.name === "TimeoutError";
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
         logWarn("channels.whatsapp_fast_path_failed", withOperationContext(op, {
           sandboxId: effectiveMeta.sandboxId,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorMessage,
           errorName: error instanceof Error ? error.name : undefined,
           action: "reconcile_and_wake",
           reason: isAbort ? "fast_path_forward_timeout" : "network_error",
@@ -251,8 +357,31 @@ export async function POST(request: Request): Promise<Response> {
             ? WHATSAPP_FAST_PATH_FORWARD_TIMEOUT_MS
             : null,
         }));
+        await recordChannelLastForward("whatsapp", {
+          ok: false,
+          status: null,
+          classification: "fetch-exception",
+          attempts: 1,
+          totalMs: Date.now() - fastPathStartedAt,
+          transport: "public",
+          sandboxUrl: null,
+          sandboxId: effectiveMeta.sandboxId ?? null,
+          finalReasonHead: errorMessage,
+          startedAt: fastPathStartedAt,
+          completedAt: Date.now(),
+          deliveryId: fastPathDeliveryId,
+        });
         effectiveMeta = await reconcileStaleRunningStatus();
       }
+    } else {
+      logInfo("channels.whatsapp_fast_path_skipped", withOperationContext(op, {
+        reason:
+          effectiveMeta.status !== "running"
+            ? `sandbox_status_${effectiveMeta.status}`
+            : "no_sandbox_id",
+        status: effectiveMeta.status,
+        sandboxId: effectiveMeta.sandboxId,
+      }));
     }
 
     let bootMessageId: string | null = null;

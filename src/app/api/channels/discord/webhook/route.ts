@@ -71,6 +71,10 @@ export async function POST(request: Request): Promise<Response> {
   const meta = await getInitializedMeta();
   const config = meta.channels.discord;
   if (!config) {
+    logWarn("channels.discord_webhook_rejected", {
+      requestId,
+      reason: "no_config",
+    });
     return Response.json(
       { error: "DISCORD_NOT_CONFIGURED", message: "Discord is not configured." },
       { status: 409 },
@@ -80,7 +84,24 @@ export async function POST(request: Request): Promise<Response> {
   const rawBody = await request.text();
   const signature = request.headers.get("x-signature-ed25519") ?? "";
   const timestamp = request.headers.get("x-signature-timestamp") ?? "";
+  if (!config.publicKey) {
+    logWarn("channels.discord_webhook_rejected", {
+      requestId,
+      reason: "no_public_key",
+      bodyLength: rawBody.length,
+    });
+    return Response.json(
+      { error: "DISCORD_SIGNATURE_INVALID", message: "Invalid Discord request signature." },
+      { status: 401 },
+    );
+  }
   if (!verifyDiscordRequestSignature(rawBody, signature, timestamp, config.publicKey)) {
+    logWarn("channels.discord_webhook_signature_invalid", {
+      requestId,
+      hasSignature: signature.length > 0,
+      hasTimestamp: timestamp.length > 0,
+      bodyLength: rawBody.length,
+    });
     return Response.json(
       { error: "DISCORD_SIGNATURE_INVALID", message: "Invalid Discord request signature." },
       { status: 401 },
@@ -91,6 +112,11 @@ export async function POST(request: Request): Promise<Response> {
   try {
     payload = JSON.parse(rawBody);
   } catch {
+    logWarn("channels.discord_webhook_rejected", {
+      requestId,
+      reason: "invalid_json",
+      bodyLength: rawBody.length,
+    });
     return Response.json(
       { error: "INVALID_JSON_BODY", message: "Invalid JSON body." },
       { status: 400 },
@@ -113,6 +139,11 @@ export async function POST(request: Request): Promise<Response> {
       dedupId: interactionId,
     });
     if (dedupResult.kind === "duplicate") {
+      logInfo("channels.discord_webhook_dedup_skip", {
+        requestId,
+        interactionId,
+        dedupKey,
+      });
       return Response.json({ type: 5 });
     }
     if (dedupResult.kind === "acquired") {

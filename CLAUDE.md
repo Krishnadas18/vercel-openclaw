@@ -73,6 +73,94 @@ These are the things Claude will otherwise get wrong:
 - **`_setAiGatewayTokenOverrideForTesting()`** is the supported way to stub OIDC in tests — do not mock `@vercel/oidc` directly.
 - **Updating env vars**: changes to `.env.example`, `README.md`, `CONTRIBUTING.md`, and `CLAUDE.md` must stay in sync — enforced by `scripts/check-verifier-contract.mjs` (`pnpm check:verify-contract`).
 
+## Debugging channel delivery
+
+When a channel (Slack/Telegram/Discord/WhatsApp) is "stuck" — message sent, bot doesn't reply — start here. **Always read the structured surfaces before guessing**: vague error strings have repeatedly masked different bugs.
+
+### Where to look, in order
+
+1. **`GET /api/admin/why-not-ready`** — aggregator. Returns typed `blockers` per channel with `kind`, `evidence`, `suggestedAction`. Single round-trip to "why is this channel red right now?". Implementation: `src/server/admin/why-not-ready.ts` → `buildWhyNotReady()`.
+2. **`GET /api/channels/summary`** — operator-facing readiness. The `slack.lastForward` (and equivalents for other channels) is the live forward outcome from `meta.channelDiagnostics.<ch>.lastForward`: `{ ok, status, classification, attempts, totalMs, sandboxUrl, sandboxId, finalReasonHead, completedAt, ageMs }`. **A green `lastForward.ok:true classification:"accepted"` within 5 minutes overrides a stale `liveConfigSync.outcome:"failed"`** (`src/app/api/channels/summary/route.ts` `buildSlackSummaryEntry`).
+3. **`GET /api/admin/sandbox-diag`** — per-port handler probes. Tells you whether port 3000 returns 200 (gateway up), 401 (Slack handler bound, signature-required), 404 (gateway up but handler not registered), or "Not listening" (sandbox port dead).
+4. **`GET /api/admin/logs`** — structured ring buffer. Filter by event prefix: `channels.`, `gateway.`, `sandbox.`, `proxy.`. The new instrumentation (commit `37b467f`) means every silent transition now emits a structured event.
+
+### The three failure modes that used to look identical
+
+Before the observability pass, all three surfaced as `"Slack route did not become ready after config sync restart"`. They are very different:
+
+| Symptom | Real cause | `lastForward.classification` | Fix |
+|---|---|---|---|
+| Sandbox is up, slack returns 404 from `/slack/events` | Channel handler never registered (configSync failed during install or wake) | `handler-not-ready` or `exhausted` with `finalReasonHead: "Not Found"` | `POST /api/admin/reset` to re-run full provisioning |
+| Gateway returns Vercel platform 502 + body `"This sandbox is not listening"` | Cached `meta.portUrls[port]` points at a dead sandbox public URL (sandbox was suspended/snapshotted but cache wasn't invalidated) | `sandbox-not-listening` | Auto-fixed: fast path detects body, calls `markSandboxPortUrlStale`, retries with fresh URL |
+| 20 retries × 2s burning through the workflow path | Sandbox itself wedged or restarting | `exhausted` (with `attempts:20`) | `POST /api/admin/reset`; check `gateway.route_probe` logs for the per-attempt status sequence |
+
+### Greppable event timeline
+
+When debugging, search `/api/admin/logs` for the requestId and follow the chain. Key prefixes:
+
+- `channels.<ch>_webhook_accepted` — webhook landed
+- `channels.<ch>_fast_path_skipped` — fast path bypassed; **always carries a structured `reason`** (e.g. `sandbox_status_snapshotting`, `listener_not_ready`, `no_sandbox_id`)
+- `channels.<ch>_fast_path_ok` / `_failed` / `_fallback_to_workflow` — fast-path outcome
+- `channels.<ch>_boot_message_sent` — wrapper sent the user a "waking up..." holding message
+- `channels.<ch>_workflow_started` — durable workflow took over (cold-wake path)
+- `channels.forward_attempt` — per-attempt log inside `forwardToNativeHandlerWithRetry` (workflow path); fields: `channel, attempt, transport, status, classification, elapsedMs`
+- `channels.forward_outcome` — final outcome written by `recordChannelLastForward` (mirrors `lastForward`)
+- `gateway.config_built` — `bundledDiscovery, allow, channels, configHash` snapshot when the gateway config JSON is rebuilt
+- `gateway.restart_started` / `gateway.restart_completed` — every gateway restart with `reason` ("config-sync", "unspecified", etc.) and `durationMs`
+- `gateway.route_probe` — per-attempt route-readiness probe with `status, attempt, elapsedMs`
+- `gateway.route_ready_timeout` — replaces the old vague string; carries `channel, lastStatus, attempts, totalMs`
+- `sandbox.port_urls.invalidated` — cache cleared (logged with `oldUrls` and `reason`)
+- `sandbox.port_urls.refreshed` — `getSandboxDomain` cache miss with new URL
+- `sandbox.port_url_dead` — `markSandboxPortUrlStale` was called
+
+### Channel parity rules — every fast path MUST
+
+These invariants hold across slack/telegram/discord/whatsapp webhook routes (`src/app/api/channels/<ch>/webhook/route.ts`). When adding a new channel or touching an existing fast path:
+
+1. Call `recordChannelLastForward(<channel>, {...})` in **every** fast-path branch (success, gateway-error, non-ok, network/timeout) — both the success and failure cases. Otherwise `lastForward` stays null and `/api/channels/summary` can't surface readiness.
+2. Use the unified classification rules in failure branches: body matches `/^This sandbox is not listening/` → `sandbox-not-listening`; status ≥ 502 → `proxy-error`; status === 404 → `handler-not-ready`; other non-2xx → `handler-error`; network/timeout → `fetch-exception`.
+3. On `sandbox-not-listening`, call `markSandboxPortUrlStale(sandboxId, port, "fast-path-not-listening")` exactly once per request (guard with a local flag). The next forward will get a fresh URL.
+4. Log a `channels.<ch>_fast_path_skipped` event with a structured `reason` whenever the gating if-condition evaluates false. Silent bypass = unsolvable bug.
+5. Workflow path (`drain-channel-workflow.ts forwardToNativeHandlerWithRetry`) already calls `recordChannelLastForward` and emits `channels.forward_attempt` for every channel uniformly — don't duplicate it on top of the workflow.
+
+### Slack OAuth "did not finish in time" is misleading
+
+`vclaw create --slack` polls for `deliveryReady:true`. OAuth itself completes — credentials are saved and `auth.test` passes — but if the configSync that runs during install hits "Slack handler not registered" (404), `liveConfigFresh` stays false and the polling times out. The fix is `POST /api/admin/reset` to re-run full provisioning; the recently-accepted-forward override then flips both `deliveryReady` and `routeReady` true on the next real Slack message.
+
+### Wake-from-sleep timeline (canonical)
+
+When a Slack message arrives while sandbox is `snapshotting`/`suspended`:
+
+```
+channels.slack_webhook_accepted
+channels.slack_fast_path_skipped reason="sandbox_status_<state>"
+channels.slack_boot_message_sent          ← user sees "Waking up..."
+channels.slack_workflow_started           ← workflow path takes over
+sandbox.status_transition: <state> → setup → running
+gateway.config_built / gateway.restart_*
+channels.forward_attempt attempt=1 status=404 classification=handler-not-ready
+channels.forward_attempt attempt=2 status=200 classification=accepted
+channels.forward_outcome ok=true classification=accepted attempts=2
+```
+
+`attempts=2` is normal on cold wake — the first probe lands before the gateway re-mounted the route. `attempts > 2` indicates a real problem.
+
+### Quick triage script
+
+```bash
+BYPASS=<your-VERCEL_AUTOMATION_BYPASS_SECRET>
+ADMIN=<your-ADMIN_SECRET>
+URL=https://<your-deployment>.vercel.app
+H="-H Authorization:Bearer\ $ADMIN -H x-vercel-protection-bypass:$BYPASS"
+
+curl -s $H "$URL/api/admin/why-not-ready" | jq .channels         # blockers per channel
+curl -s $H "$URL/api/channels/summary"     | jq '.slack.lastForward, .slack.readiness'
+curl -s $H "$URL/api/admin/sandbox-diag"   | jq '.sandboxStatus, .ports'
+curl -s $H "$URL/api/admin/logs"           | jq '.logs[] | select(.message | startswith("channels.") or startswith("gateway.") or startswith("sandbox."))' | head -100
+```
+
+If `lastForward.classification === "sandbox-not-listening"` and the URL doesn't auto-refresh, the fix has regressed — check `markSandboxPortUrlStale` is still wired into the relevant fast path. If `sandbox-diag` shows port 3000 with `httpStatus:404 message:"Handler not registered yet"` and stays stuck, the gateway's bundle never bound the channel route — `POST /api/admin/reset`.
+
 ## Auth modes
 
 - `admin-secret` (default) — accepts `Authorization: Bearer <admin-secret>` **or** the encrypted `openclaw_admin` session cookie. CSRF is enforced on cookie-based mutations, not bearer. `ADMIN_SECRET` auto-generates locally if unset; `/api/setup` is sealed on Vercel (returns 410).
