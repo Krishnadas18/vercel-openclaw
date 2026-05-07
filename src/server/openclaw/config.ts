@@ -563,18 +563,10 @@ export function buildGatewayConfig(
     update: {
       checkOnStart: false,
     },
-    // Force compat-mode plugin discovery so bundled channel plugins (slack,
-    // telegram, whatsapp, discord) lazy-activate from per-channel config.
-    // Upstream openclaw flipped the default `bundledDiscovery` from "compat"
-    // to "allowlist" in commit b2096d19ec; the bundle's activation gate
-    // (dist/activation-context-*.js) then requires either compat mode or an
-    // explicit allow entry before it will instantiate a bundled channel
-    // handler from config alone. Slack's manifest has `activation.onStartup
-    // = false`, so without this, `/slack/events` never mounts in the gateway,
-    // the readiness probe in lifecycle.ts keeps 404-ing, routeReady stays
-    // false, liveConfigFresh stays false, and real Slack webhooks 404.
+    // Explicitly allow bundled channel plugins so handlers lazy-activate from
+    // per-channel config. Older OpenClaw builds also accepted
+    // `plugins.bundledDiscovery`, but current bundles reject that legacy key.
     plugins: {
-      bundledDiscovery: "compat",
       allow: ["slack", "telegram", "whatsapp", "discord"],
     },
   };
@@ -743,12 +735,10 @@ export function buildGatewayConfig(
   }
 
   const serialized = JSON.stringify(config);
-  const pluginsBlock = config.plugins as
-    | { bundledDiscovery?: unknown; allow?: unknown }
-    | undefined;
+  const pluginsBlock = config.plugins as { allow?: unknown } | undefined;
   const channelsBlock = (config.channels as Record<string, unknown> | undefined) ?? {};
   logInfo("gateway.config_built", {
-    bundledDiscovery: Boolean(pluginsBlock?.bundledDiscovery),
+    bundledDiscovery: false,
     allow: Array.isArray(pluginsBlock?.allow)
       ? (pluginsBlock.allow as unknown[]).length
       : 0,
