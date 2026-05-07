@@ -202,16 +202,15 @@ test("processChannelStep skips ensureSandboxReady when boot returns running", as
   assert.equal(forwardedSandboxId, "sbx-booted");
 });
 
-test("processChannelStep retains Telegram boot message after accepted forward", async () => {
+test("processChannelStep clears Telegram boot message after accepted forward", async () => {
   let updateCalls = 0;
   let clearCalls = 0;
-  let lastUpdateText: string | null = null;
 
   const dependencies = createWorkflowDependencies({
     buildExistingBootHandle: async () => ({
       async update(text: string) {
         updateCalls += 1;
-        lastUpdateText = text;
+        void text;
       },
       async clear() {
         clearCalls += 1;
@@ -235,30 +234,26 @@ test("processChannelStep retains Telegram boot message after accepted forward", 
     dependencies,
   });
 
-  assert.equal(updateCalls, 1, "accepted Telegram forward should update the boot placeholder");
-  assert.equal(clearCalls, 0, "accepted Telegram forward should not delete the boot placeholder");
-  assert.match(lastUpdateText ?? "", /OpenClaw received your message/);
-  assert.match(lastUpdateText ?? "", /Working on the reply/);
+  assert.equal(updateCalls, 0, "accepted Telegram forward should not update the boot placeholder");
+  assert.equal(clearCalls, 1, "accepted Telegram forward should delete the boot placeholder");
 
   const logs = getServerLogs();
-  const retainedLog = logs.find(
-    (entry) => entry.message === "channels.telegram_boot_message_retained_after_accept",
+  const clearedLog = logs.find(
+    (entry) => entry.message === "channels.telegram_boot_message_cleared_after_accept",
   );
-  assert.ok(retainedLog, "placeholder retention should be logged");
+  assert.ok(clearedLog, "placeholder cleanup should be logged");
   assert.ok(
-    !logs.some((entry) => entry.message === "channels.telegram_boot_message_cleared_after_accept"),
-    "accepted Telegram forward should not log placeholder cleanup",
+    !logs.some((entry) => entry.message === "channels.telegram_boot_message_retained_after_accept"),
+    "accepted Telegram forward should not log placeholder retention",
   );
-  assert.equal(retainedLog?.data?.deliveryId, "telegram:1");
-  assert.equal(retainedLog?.data?.requestId, "req-clear");
-  assert.equal(retainedLog?.data?.bootMessageId, 17);
-  assert.equal(retainedLog?.data?.forwardStatus, 200);
-  assert.equal(retainedLog?.data?.forwardAttempts, 1);
-  assert.equal(retainedLog?.data?.forwardTransport, "local");
-  assert.equal(retainedLog?.data?.clearOnAccept, false);
-  assert.equal(retainedLog?.data?.downstreamReplyReceiptObserved, false);
-  assert.equal(retainedLog?.data?.downstreamReplyReceiptImplemented, false);
-  assert.equal(typeof retainedLog?.data?.staleAfterMs, "number");
+  assert.equal(clearedLog?.data?.deliveryId, "telegram:1");
+  assert.equal(clearedLog?.data?.requestId, "req-clear");
+  assert.equal(clearedLog?.data?.bootMessageId, 17);
+  assert.equal(clearedLog?.data?.forwardStatus, 200);
+  assert.equal(clearedLog?.data?.forwardAttempts, 1);
+  assert.equal(clearedLog?.data?.forwardTransport, "local");
+  assert.equal(clearedLog?.data?.clearOnAccept, true);
+  assert.equal(clearedLog?.data?.placeholderAction, "cleared");
 });
 
 test("processChannelStep falls back to ensureSandboxReady when boot returns non-running", async () => {
@@ -879,8 +874,11 @@ test("processChannelStep emits channels.telegram_wake_summary for Telegram reque
   assert.equal(data.hotSpareRejectReason, "feature-disabled");
 });
 
-test("processChannelStep logs Telegram probe mismatch when public probe becomes ready after local stall", async () => {
+test("processChannelStep collapses Telegram public probe into forward retry loop after local stall", async () => {
   _resetLogBuffer();
+
+  let publicProbeCalls = 0;
+  let preferLocalHint: boolean | null = null;
 
   const dependencies = createWorkflowDependencies({
     runWithBootMessages: async () => ({
@@ -916,50 +914,62 @@ test("processChannelStep logs Telegram probe mismatch when public probe becomes 
       bodyHead: "",
       headers: null,
     }),
-    waitForTelegramNativeHandler: async () => ({
-      ready: true,
-      attempts: 20,
-      waitMs: 15_000,
-      lastStatus: 401,
-      publicUrl: "https://tg.test",
-      timeline: [{ attempt: 20, elapsedMs: 15_000, status: 401 }],
-    }),
-    forwardToNativeHandlerWithRetry: async () => ({
-      ok: true,
-      status: 200,
-      attempts: 2,
-      totalMs: 120,
-      transport: "public",
-      retries: [{ attempt: 1, reason: "proxy-error", status: 502 }],
-    }),
+    waitForTelegramNativeHandler: async () => {
+      publicProbeCalls += 1;
+      return {
+        ready: true,
+        attempts: 20,
+        waitMs: 15_000,
+        lastStatus: 401,
+        publicUrl: "https://tg.test",
+        timeline: [{ attempt: 20, elapsedMs: 15_000, status: 401 }],
+      };
+    },
+    forwardToNativeHandlerWithRetry: async (
+      _channel,
+      _payload,
+      _meta,
+      _getSandboxDomain,
+      _forwardTelegramToNativeHandlerLocally,
+      preferLocalTelegramForward,
+    ) => {
+      preferLocalHint = preferLocalTelegramForward ?? null;
+      return {
+        ok: true,
+        status: 200,
+        attempts: 2,
+        totalMs: 120,
+        transport: "public",
+        retries: [{ attempt: 1, reason: "proxy-error", status: 502 }],
+      };
+    },
   });
 
   await processChannelStep("telegram", { update_id: 99 }, "test", "req-mismatch", null, {
     dependencies,
   });
 
+  assert.equal(publicProbeCalls, 0, "public Telegram readiness probe should not block the critical path");
+  assert.equal(preferLocalHint, false, "local forward should not be preferred after a failed local hint");
+
   const logs = getServerLogs();
   const mismatchLog = logs.find((entry) => entry.message === "channels.telegram_probe_local_mismatch");
-  assert.ok(mismatchLog, "mismatch log should be emitted when public probe succeeds after local stall");
-  assert.equal(mismatchLog.data?.sandboxId, "sbx-mismatch");
-  assert.equal(mismatchLog.data?.publicWaitMs, 15_000);
-  assert.equal(mismatchLog.data?.localStatus, 404);
-  assert.equal(mismatchLog.data?.localReady, false);
-  assert.equal(mismatchLog.data?.localError, "connect ECONNREFUSED");
-  assert.equal(mismatchLog.data?.localDetail, "handler-not-bound");
+  assert.equal(mismatchLog, undefined, "public-probe mismatch log is obsolete when public probe is skipped");
 
   const summaryLog = logs.find((entry) => entry.message === "channels.telegram_wake_summary");
   assert.ok(summaryLog, "telegram wake summary should be emitted");
-  assert.equal(summaryLog.data?.telegramProbeReady, true);
-  assert.equal(summaryLog.data?.telegramProbeLastStatus, 401);
-  assert.equal(summaryLog.data?.telegramProbeSkippedReason, null);
+  assert.equal(summaryLog.data?.telegramProbeReady, false);
+  assert.equal(summaryLog.data?.telegramProbeLastStatus, null);
+  assert.equal(summaryLog.data?.telegramProbeSkippedReason, "collapsed-forward-loop");
+  assert.equal(summaryLog.data?.telegramReadinessMode, "single-local-hint");
+  assert.equal(typeof summaryLog.data?.telegramPreForwardProbeMs, "number");
+  assert.equal(typeof summaryLog.data?.telegramWorkflowToFirstForwardAttemptMs, "number");
   assert.equal(summaryLog.data?.telegramLocalProbeStatus, 404);
   assert.equal(summaryLog.data?.telegramLocalProbeReady, false);
   assert.equal(summaryLog.data?.telegramLocalProbeError, "connect ECONNREFUSED");
   assert.equal(summaryLog.data?.telegramLocalProbeDetail, "handler-not-bound");
-  assert.equal(summaryLog.data?.postLocalReadyBlockingMs, 15_400);
-  assert.equal(summaryLog.data?.telegramReconcileBlocking, true);
-  assert.equal(summaryLog.data?.telegramSecretSyncBlocking, true);
+  assert.equal(summaryLog.data?.retryingForwardAttempts, 2);
+  assert.equal(summaryLog.data?.retryingForwardTransport, "public");
 });
 
 test("processChannelStep does NOT emit telegram_wake_summary for Slack requests", async () => {
@@ -1191,7 +1201,7 @@ test("processChannelStep does NOT run Telegram-specific probe for Slack or Whats
   assert.equal(probeCallCount, 0, "Telegram probe should NOT run for WhatsApp");
 });
 
-test("processChannelStep falls back to public Telegram probe when local handler is not ready", async () => {
+test("processChannelStep skips public Telegram probe when local handler is not ready", async () => {
   let probeCallCount = 0;
   let forwardCalled = false;
 
@@ -1234,8 +1244,8 @@ test("processChannelStep falls back to public Telegram probe when local handler 
 
   await processChannelStep("telegram", { update_id: 1 }, "test", "req-probe-timeout", null, { dependencies });
 
-  assert.equal(probeCallCount, 1, "public probe should run when local handler is not ready");
-  assert.ok(forwardCalled, "forward should still be attempted after public probe fallback");
+  assert.equal(probeCallCount, 0, "public probe should not block the critical path when local handler is not ready");
+  assert.ok(forwardCalled, "forward retry loop should still be attempted after local probe hint");
 });
 
 test("processChannelStep still forwards when both Telegram probes time out", async () => {

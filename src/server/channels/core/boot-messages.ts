@@ -23,6 +23,19 @@ const STATUS_MESSAGES: Partial<Record<SingleMeta["status"], string>> = {
   running: "🦞 Connecting\u2026",
 };
 
+const TELEGRAM_STATUS_MESSAGES: Partial<Record<SingleMeta["status"], string>> = {
+  setup: "🦞 Starting Telegram listener\u2026",
+  booting: "🦞 Starting Telegram listener\u2026",
+  running: "🦞 Delivering your message\u2026",
+};
+
+function statusMessageFor(channel: ChannelName, status: SingleMeta["status"]): string | undefined {
+  if (channel === "telegram") {
+    return TELEGRAM_STATUS_MESSAGES[status] ?? STATUS_MESSAGES[status];
+  }
+  return STATUS_MESSAGES[status];
+}
+
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
 const BOOT_MESSAGE_CLEAR_DELAY_MS = 500;
 
@@ -147,7 +160,7 @@ export async function runWithBootMessages<
     if (existingBootHandle) {
       if (deferCleanupToCaller) {
         void existingBootHandle
-          .update(STATUS_MESSAGES.running ?? "🦞 Connecting\u2026")
+          .update(statusMessageFor(channel, "running") ?? "🦞 Connecting\u2026")
           .catch((error) => {
             logWarn("channels.boot_message_update_failed", {
               channel,
@@ -200,7 +213,7 @@ export async function runWithBootMessages<
 
       if (meta.status !== lastStatus) {
         lastStatus = meta.status;
-        const statusMessage = STATUS_MESSAGES[meta.status];
+        const statusMessage = statusMessageFor(channel, meta.status);
         if (statusMessage) {
           void handle.update(statusMessage).catch((error) => {
             logWarn("channels.boot_message_update_failed", {
@@ -235,7 +248,7 @@ export async function runWithBootMessages<
         const probe = await probeGatewayReady();
         if (probe.ready) {
           void handle
-            .update(STATUS_MESSAGES.running ?? "Processing your message\u2026")
+            .update(statusMessageFor(channel, "running") ?? "Processing your message\u2026")
             .catch((error) => {
               logWarn("channels.boot_message_update_failed", {
                 channel,
@@ -262,7 +275,7 @@ export async function runWithBootMessages<
       // The boot-message poll loop has thrown — the caller will get a
       // workflow-level retry/terminal message, but if this is a sandbox-
       // start failure (timeout or "error" state), the user has been
-      // staring at "🦞 Verifying config…" / "🦞 Starting OpenClaw…" the
+      // staring at a setup/booting status message the
       // whole time. Push ONE final synchronous chat.update with a
       // diagnostic message so the placeholder reflects reality before
       // the error propagates to the workflow's own catch handler.

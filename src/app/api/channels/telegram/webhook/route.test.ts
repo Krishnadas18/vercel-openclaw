@@ -609,6 +609,115 @@ test("Telegram webhook: generic native 500 starts workflow and sends waiting mes
   });
 });
 
+test("Telegram webhook: repairs stale Telegram port URL once before workflow wake path", async () => {
+  await withHarness(async (h) => {
+    await configureTelegram(h);
+    await h.mutateMeta((meta) => {
+      meta.status = "running";
+      meta.sandboxId = "sbx-telegram-repair";
+      meta.snapshotId = "snap-telegram-repair";
+      meta.portUrls = {
+        "3000": "https://sbx-telegram-repair-3000.fake.vercel.run",
+        "8787": "https://stale-telegram-repair-8787.fake.vercel.run",
+      };
+      meta.lastRestoreMetrics = {
+        sandboxCreateMs: 0,
+        tokenWriteMs: 0,
+        assetSyncMs: 0,
+        startupScriptMs: 0,
+        forcePairMs: 0,
+        firewallSyncMs: 0,
+        localReadyMs: 0,
+        publicReadyMs: 0,
+        totalMs: 0,
+        skippedStaticAssetSync: false,
+        assetSha256: null,
+        vcpus: 1,
+        recordedAt: Date.now(),
+        telegramListenerReady: true,
+      };
+    });
+
+    let forwardCalls = 0;
+    h.fakeFetch.onPost(/telegram-webhook$/, () => {
+      forwardCalls += 1;
+      if (forwardCalls === 1) {
+        return new Response(
+          JSON.stringify({
+            error: {
+              code: "502",
+              id: "fra1:iad1::87bgt-test",
+              message: "This sandbox is not listening on the requested port.",
+            },
+          }),
+          { status: 502, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("ok", { status: 200 });
+    });
+    const sendMessageCalls: string[] = [];
+    h.fakeFetch.onPost(/api\.telegram\.org.*\/sendMessage$/, (url) => {
+      sendMessageCalls.push(url);
+      return Response.json({ ok: true, result: { message_id: 88 } });
+    });
+
+    const route = getTelegramWebhookRoute();
+    const startMock = mock.method(telegramWebhookWorkflowRuntime, "start", async () => {});
+
+    try {
+      _resetLogBuffer();
+      const req = buildTelegramWebhook({ webhookSecret: TELEGRAM_WEBHOOK_SECRET });
+      const result = await callRoute(route.POST, req);
+      assert.equal(result.status, 200);
+      assert.deepEqual(result.json, { ok: true });
+      assert.equal(forwardCalls, 2, "stale-port repair should make exactly one retry");
+      assert.equal(startMock.mock.callCount(), 0, "workflow should not start after stale-port repair accepts");
+      assert.equal(sendMessageCalls.length, 0, "stale-port repair should avoid sending a waiting message");
+
+      const logs = getServerLogs();
+      const repairAttemptLog = logs.find(
+        (entry) => entry.message === "channels.telegram_fast_path_stale_port_repair_attempt",
+      );
+      assert.ok(repairAttemptLog, "stale-port repair attempt should be logged");
+      assert.equal(repairAttemptLog.data?.oldUrl, "https://stale-telegram-repair-8787.fake.vercel.run");
+      assert.equal(repairAttemptLog.data?.newUrl, "https://sbx-telegram-repair-8787.fake.vercel.run");
+      assert.equal(repairAttemptLog.data?.attempt, 2);
+
+      const repairResultLog = logs.find(
+        (entry) => entry.message === "channels.telegram_fast_path_stale_port_repair_result",
+      );
+      assert.ok(repairResultLog, "stale-port repair result should be logged");
+      assert.equal(repairResultLog.data?.accepted, true);
+      assert.equal(repairResultLog.data?.workflowStarted, false);
+      assert.equal(repairResultLog.data?.bootMessageSent, false);
+      assert.equal(repairResultLog.data?.classification, "accepted");
+
+      const okLog = logs.find(
+        (entry) => entry.message === "channels.telegram_fast_path_ok" && entry.data?.repairedStalePort === true,
+      );
+      assert.ok(okLog, "repaired fast-path success should be logged");
+
+      const forwardOutcomeLogs = logs.filter((entry) => entry.message === "channels.forward_outcome");
+      const acceptedOutcome = forwardOutcomeLogs.find(
+        (entry) => entry.data?.channel === "telegram" && entry.data?.ok === true,
+      );
+      assert.ok(acceptedOutcome, "accepted stale-port repair should update lastForward");
+      assert.equal(acceptedOutcome.data?.attempts, 2);
+      assert.equal(acceptedOutcome.data?.classification, "accepted");
+
+      const meta = await h.getMeta();
+      assert.equal(
+        meta.portUrls?.["8787"],
+        "https://sbx-telegram-repair-8787.fake.vercel.run",
+        "dead Telegram port URL should be refreshed before repair retry",
+      );
+      resetAfterCallbacks();
+    } finally {
+      startMock.mock.restore();
+    }
+  });
+});
+
 test("Telegram webhook: fast path non-ok response falls through to workflow wake path", async () => {
   await withHarness(async (h) => {
     await configureTelegram(h);

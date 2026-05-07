@@ -28,10 +28,6 @@ import {
 // enough to cover a reasonable long-turn window so the bot-reply
 // cleanup path still finds them. Short TTL (10 min) left orphans.
 const PENDING_BOOT_MESSAGE_TTL_SECONDS = 60 * 60;
-const TELEGRAM_ACCEPTED_PLACEHOLDER_STALE_AFTER_MS = 5 * 60 * 1000;
-const TELEGRAM_ACCEPTED_PLACEHOLDER_TEXT =
-  "🦞 OpenClaw received your message. Working on the reply…\n\nIf this stays here for more than a few minutes, try again.";
-
 // Discord deferred-interaction tokens are valid for 15 minutes. Soft-
 // deadline a little under that so a reply attempt at 13.5min still
 // has wall-clock to land before Discord starts returning 404
@@ -576,7 +572,6 @@ export async function processChannelStep(
     forwardToNativeHandler,
     forwardTelegramToNativeHandlerLocally,
     forwardToNativeHandlerWithRetry,
-    waitForTelegramNativeHandler: waitForTgHandler,
     probeTelegramNativeHandlerLocally,
     buildExistingBootHandle,
   } = resolvedDependencies;
@@ -643,6 +638,7 @@ export async function processChannelStep(
       origin,
       reason: `channel:${channel}`,
       timeoutMs: WORKFLOW_SANDBOX_READY_TIMEOUT_MS,
+      pollIntervalMs: channel === "telegram" ? 250 : undefined,
       existingBootHandle,
       deferCleanupToCaller: deferBootCleanup,
     });
@@ -782,12 +778,15 @@ export async function processChannelStep(
     let retryingResult: RetryingForwardResult | null = null;
 
     const forwardStartedAt = Date.now();
+    if (channel === "telegram") {
+      diag.telegramWorkflowToFirstForwardAttemptMs = forwardStartedAt - workflowStartedAt;
+    }
     console.log(`[DIAG] Phase 2: forwarding to native handler channel=${channel}`);
 
-    // For Telegram, port 3000 readiness is not enough. The public 8787
-    // surface can return generic empty 200s long before the real handler
-    // is reachable. Use the in-sandbox 127.0.0.1 probe as the readiness
-    // gate, and keep the public probe only for diagnostics.
+    // For Telegram, port 3000 readiness is not enough. Use at most one local
+    // 127.0.0.1 probe as a transport hint, then let the retrying forward loop
+    // be the readiness mechanism. Serial local/public probe loops add seconds
+    // before the first real delivery attempt on the core chat path.
     if (channel === "telegram") {
       const { OPENCLAW_TELEGRAM_WEBHOOK_PORT } = await import("@/server/openclaw/config");
       const webhookSecret = effectiveReadyMeta.channels?.telegram?.webhookSecret ?? null;
@@ -805,7 +804,10 @@ export async function processChannelStep(
       const restoreListenerReady =
         effectiveReadyMeta.status === "running"
         && effectiveReadyMeta.lastRestoreMetrics?.telegramListenerReady === true;
-      let localProbeResult: TelegramLocalProbeResult | null = restoreListenerReady
+      const readinessMode = "single-local-hint";
+      diag.telegramReadinessMode = readinessMode;
+      const preForwardProbeStartedAt = Date.now();
+      const localProbeResult: TelegramLocalProbeResult | null = restoreListenerReady
         ? {
             status: 401,
             ready: true,
@@ -820,36 +822,16 @@ export async function processChannelStep(
               webhookSecret,
             )
           : null;
-      const localProbeStartedAt = Date.now();
-      while (
-        effectiveReadyMeta.sandboxId
-        && localProbeResult?.ready !== true
-        && Date.now() - localProbeStartedAt < TELEGRAM_PROBE_TIMEOUT_MS
-      ) {
-        await new Promise((r) => setTimeout(r, TELEGRAM_PROBE_INTERVAL_MS));
-        localProbeResult = await probeTelegramNativeHandlerLocally(
-          effectiveReadyMeta.sandboxId,
-          OPENCLAW_TELEGRAM_WEBHOOK_PORT,
-          webhookSecret,
-        );
-      }
-      const probeResult =
-        effectiveReadyMeta.sandboxId && localProbeResult?.ready === true
-          ? null
-          : await waitForTgHandler(
-              getSandboxDomain,
-              OPENCLAW_TELEGRAM_WEBHOOK_PORT,
-              webhookSecret,
-            );
-
-      diag.telegramProbeReady = probeResult?.ready ?? null;
-      diag.telegramProbeAttempts = probeResult?.attempts ?? null;
-      diag.telegramProbeWaitMs = probeResult?.waitMs ?? null;
-      diag.telegramProbeLastStatus = probeResult?.lastStatus ?? null;
-      diag.telegramProbePublicUrl = probeResult?.publicUrl ?? null;
-      diag.telegramProbeTimeline = probeResult?.timeline ?? null;
+      diag.telegramProbeReady = null;
+      diag.telegramProbeAttempts = null;
+      diag.telegramProbeWaitMs = null;
+      diag.telegramProbeLastStatus = null;
+      diag.telegramProbePublicUrl = null;
+      diag.telegramProbeTimeline = null;
       diag.telegramProbeSkippedReason =
-        probeResult === null ? "local-handler-ready" : null;
+        localProbeResult?.ready === true
+          ? "local-handler-ready"
+          : "collapsed-forward-loop";
       diag.telegramLocalProbeStatus = localProbeResult?.status ?? null;
       diag.telegramLocalProbeReady = localProbeResult?.ready ?? null;
       diag.telegramLocalProbeError = localProbeResult?.error ?? null;
@@ -858,8 +840,9 @@ export async function processChannelStep(
       diag.telegramLocalProbeBodyLength = localProbeResult?.bodyLength ?? null;
       diag.telegramLocalProbeBodyHead = localProbeResult?.bodyHead ?? null;
       diag.telegramLocalProbeHeaders = localProbeResult?.headers ?? null;
+      diag.telegramPreForwardProbeMs = Date.now() - preForwardProbeStartedAt;
       console.log(
-        `[DIAG] Telegram native handler probe done: publicReady=${probeResult?.ready ?? "skipped"} attempts=${probeResult?.attempts ?? 0} waitMs=${probeResult?.waitMs ?? 0} lastStatus=${probeResult?.lastStatus ?? "n/a"} localStatus=${localProbeResult?.status ?? "n/a"} localError=${localProbeResult?.error ?? "none"} localDetail=${localProbeResult?.detail ?? "none"}`,
+        `[DIAG] Telegram native handler probe done: readinessMode=${readinessMode} publicReady=skipped attempts=0 waitMs=0 lastStatus=n/a localStatus=${localProbeResult?.status ?? "n/a"} localError=${localProbeResult?.error ?? "none"} localDetail=${localProbeResult?.detail ?? "none"}`,
       );
       await persistDiagSnapshot("telegram-probe-complete", {
         telegramProbeReady: diag.telegramProbeReady ?? null,
@@ -872,29 +855,15 @@ export async function processChannelStep(
         telegramLocalProbeError: diag.telegramLocalProbeError ?? null,
         telegramLocalProbeDetail: diag.telegramLocalProbeDetail ?? null,
         telegramLocalProbeDurationMs: diag.telegramLocalProbeDurationMs ?? null,
+        telegramReadinessMode: diag.telegramReadinessMode ?? null,
+        telegramPreForwardProbeMs: diag.telegramPreForwardProbeMs ?? null,
       });
 
-      if (probeResult?.ready === true && localProbeResult?.ready !== true) {
-        logWarn("channels.telegram_probe_local_mismatch", {
-          channel,
-          requestId,
-          sandboxId: effectiveReadyMeta.sandboxId,
-          publicLastStatus: probeResult.lastStatus,
-          publicAttempts: probeResult.attempts,
-          publicWaitMs: probeResult.waitMs,
-          localStatus: localProbeResult?.status ?? null,
-          localReady: localProbeResult?.ready ?? null,
-          localError: localProbeResult?.error ?? null,
-          localDetail: localProbeResult?.detail ?? null,
-        });
-      }
-
-      const publicProbeSawDeadSandbox = telegramPublicProbeSawSandboxNotListening(probeResult);
+      const publicProbeSawDeadSandbox = false;
       const localProbeSawDeadSandbox = telegramLocalProbeSawConnectionRefused(localProbeResult);
       if (
         localProbeResult?.ready !== true
-        && probeResult?.ready !== true
-        && (publicProbeSawDeadSandbox || localProbeSawDeadSandbox)
+        && localProbeSawDeadSandbox
       ) {
         logWarn("channels.telegram_probe_dead_sandbox_reconcile", {
           channel,
@@ -903,10 +872,10 @@ export async function processChannelStep(
           sandboxId: effectiveReadyMeta.sandboxId,
           publicProbeSawDeadSandbox,
           localProbeSawDeadSandbox,
-          publicLastStatus: probeResult?.lastStatus ?? null,
-          publicAttempts: probeResult?.attempts ?? null,
-          publicWaitMs: probeResult?.waitMs ?? null,
-          publicUrl: probeResult?.publicUrl ?? null,
+          publicLastStatus: null,
+          publicAttempts: null,
+          publicWaitMs: null,
+          publicUrl: null,
           localStatus: localProbeResult?.status ?? null,
           localError: localProbeResult?.error ?? null,
           localDetail: localProbeResult?.detail ?? null,
@@ -950,11 +919,19 @@ export async function processChannelStep(
         effectiveReadyMeta,
         getSandboxDomain,
         forwardTelegramToNativeHandlerLocally,
-        Boolean(effectiveReadyMeta.sandboxId),
+        localProbeResult?.ready === true,
         null,
         null,
         deliveryId,
       );
+      diag.telegramReadinessMode = readinessMode;
+      diag.telegramPreForwardProbeMs = Date.now() - preForwardProbeStartedAt;
+      if (retryingResult.attemptsDetail?.[0]?.startedAtMs != null) {
+        diag.telegramWorkflowToFirstForwardAttemptMs = Math.max(
+          0,
+          retryingResult.attemptsDetail[0].startedAtMs - workflowStartedAt,
+        );
+      }
       forwardResult = { ok: retryingResult.ok, status: retryingResult.status };
     } else if (channel === "slack") {
       // Slack on port 3000 returns 404 until Bolt's HTTPReceiver registers
@@ -1193,6 +1170,9 @@ export async function processChannelStep(
           typeof diag.telegramProbeSkippedReason === "string"
             ? diag.telegramProbeSkippedReason
             : null,
+        telegramReadinessMode: diag.telegramReadinessMode ?? null,
+        telegramPreForwardProbeMs: diag.telegramPreForwardProbeMs ?? null,
+        telegramWorkflowToFirstForwardAttemptMs: diag.telegramWorkflowToFirstForwardAttemptMs ?? null,
         telegramLocalProbeStatus: diag.telegramLocalProbeStatus ?? null,
         telegramLocalProbeReady: diag.telegramLocalProbeReady ?? null,
         telegramLocalProbeError: diag.telegramLocalProbeError ?? null,
@@ -1299,15 +1279,12 @@ export async function processChannelStep(
           }
         }
       } else if (channel === "telegram" && forwardResult.ok) {
-        diag.bootMessageAction = "telegram-retained-after-native-accept";
-        diag.bootMessageRetainedAt = Date.now();
-        diag.bootMessageStaleAfterMs = TELEGRAM_ACCEPTED_PLACEHOLDER_STALE_AFTER_MS;
-        diag.downstreamReplyReceiptObserved = false;
-        diag.downstreamReplyReceiptImplemented = false;
+        diag.bootMessageAction = "telegram-cleared-after-native-accept";
+        diag.bootMessageClearedAt = Date.now();
         await existingBootHandle
-          .update(TELEGRAM_ACCEPTED_PLACEHOLDER_TEXT)
+          .clear()
           .then(() => {
-            logInfo("channels.telegram_boot_message_retained_after_accept", {
+            logInfo("channels.telegram_boot_message_cleared_after_accept", {
               channel,
               requestId,
               deliveryId,
@@ -1316,17 +1293,13 @@ export async function processChannelStep(
               forwardAttempts: retryingResult?.attempts ?? null,
               forwardTransport: retryingResult?.transport ?? null,
               forwardTotalMs: retryingResult?.totalMs ?? null,
-              placeholderAction: "updated-and-retained",
-              placeholderTextKey: "telegram_native_accept_waiting_for_reply",
-              clearOnAccept: false,
-              downstreamReplyReceiptObserved: false,
-              downstreamReplyReceiptImplemented: false,
-              reason: "native_http_accept_is_not_telegram_reply_receipt",
-              staleAfterMs: TELEGRAM_ACCEPTED_PLACEHOLDER_STALE_AFTER_MS,
+              placeholderAction: "cleared",
+              clearOnAccept: true,
+              reason: "native_handler_accepted_update",
             });
           })
           .catch((bootError) => {
-            logWarn("channels.telegram_boot_message_retention_update_failed", {
+            logWarn("channels.telegram_boot_message_cleanup_after_accept_failed", {
               channel,
               requestId,
               deliveryId,
