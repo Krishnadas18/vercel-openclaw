@@ -21,6 +21,15 @@ Use after `channel-debug-core` for Slack issues.
 Slack event -> /api/channels/slack/webhook -> Slack signature validation over raw body -> event/bot/subtype/user-message dedup -> fast path to port 3000 /slack/events OR workflow -> Bolt signature re-verification -> threaded Slack reply
 ```
 
+## Parallel Lane Inputs To Consume
+
+Before proposing a Slack fix, consume:
+
+- Vercel/app logs lane: `channels.slack_webhook_accepted`, fast-path event, fallback/workflow event, requestId/deliveryId, and project targeting proof.
+- Sandbox runtime lane: port 3000 listener, `/slack/events` probe behavior, OpenClaw plugin count, sanitized config has `channels.slack`.
+- Workflow lane: `drainChannelWorkflow` run state when fast path skipped/failed, with verified project targeting when `.vercel/project.json` differs from the incident target.
+- Prior-fix comparison: openclaw-42 zero-plugin wedge, stale sandbox URL, workflow retry exhaustion, Slack 401 raw-body/signature failure.
+
 ## Special Checks
 
 - Raw body and `x-slack-*` headers must survive forwarding.

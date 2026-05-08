@@ -21,6 +21,15 @@ Use after `channel-debug-core` for WhatsApp issues.
 Meta webhook verification GET OR message POST -> app route -> x-hub-signature-256 validation -> dedup -> fast path to port 3000 /whatsapp-webhook OR workflow -> WhatsApp adapter/API reply
 ```
 
+## Parallel Lane Inputs To Consume
+
+Before proposing a WhatsApp fix, consume:
+
+- Vercel/app logs lane: GET verification vs POST delivery, signature result, requestId/deliveryId/Meta message ID, and project targeting proof.
+- Sandbox runtime lane: port 3000 listener and `/whatsapp-webhook` behavior, sanitized config has `channels.whatsapp`.
+- Workflow lane: workflow start/run/forward state when fast path skipped or failed, with verified project targeting when `.vercel/project.json` differs from the incident target.
+- Prior-fix comparison: linkState projection mistaken as delivery, status-only skip, boot message send/delete, handler non-OK classification.
+
 ## Special Checks
 
 - GET verification and POST delivery are different paths.

@@ -81,6 +81,38 @@ When a channel (Slack/Telegram/Discord/WhatsApp) is "stuck" — message sent, bo
 
 This system has layered failures (OAuth, sandbox lifecycle, gateway routes, plugin loading, cached URLs, fast path vs workflow). When debugging it, follow this discipline — past sessions burned hours when we let momentum override evidence.
 
+### Start with parallel evidence fan-out
+
+For live channel incidents, the parent agent must start with parallel evidence collection. Before any patch proposal, create one artifact root and spawn these lanes in parallel:
+
+```bash
+CHANNEL=<slack|telegram|discord|whatsapp>
+RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+ART=".agent-runs/channel-debug/$RUN_TS/$CHANNEL"
+mkdir -p "$ART"/{admin,vercel,sandbox,workflow,channel}
+```
+
+Before running `vercel`, `npx sandbox`, or `npx workflow`, prove the command is targeting the intended Vercel project/team/deployment. Inspect `.vercel/project.json`; if it points at a different release, use explicit project/team/deployment targeting and record the mismatch. This repo may still be linked to release 45 (`vercel-openclaw-45`, `prj_ag6Uzj9b4deNK98jVS5SO0H2Shmx`), while release 46 uses `vercel-openclaw-46`, `prj_JSzrXyJiMzT6F7BUA76Naa7nkjRa`, team `vercel-internal-playground`. If a tool says it inferred the project from `.vercel`, treat the output as suspect until it matches the incident target.
+
+If a release-specific env file is supplied, such as `.env.45` for release 45, source it only in the shell running live investigation commands:
+
+```bash
+set -a
+. ./.env.45
+set +a
+```
+
+Use release env files only for live investigation context: deployment URL, Vercel token/project/team/deployment context, `ADMIN_SECRET`, Deployment Protection bypass, and platform credentials required to inspect that run. Never paste, print, or save raw values. Evidence may record `envFileUsed: ".env.45"` and the names of variables used, not their values.
+
+Parallel lanes:
+
+- **Vercel/app logs + admin surfaces lane** — collect deployment proof, project targeting proof, admin readiness endpoints, and Vercel runtime logs. Save `why-not-ready.json`, `channels-summary.json`, `sandbox-diag.json`, `admin-logs.json`, `channel-runtime.jsonl`, and request-id logs when available.
+- **Sandbox runtime lane** — extract the actual Vercel Sandbox ID from `/api/admin/sandbox-diag` or recent `lastForward.sandboxId`. Do not pass `oc-prj*`, `prj_*`, `OPENCLAW_INSTANCE_ID`, or `VERCEL_PROJECT_ID` as the positional sandbox ID to `npx sandbox`. If `npx sandbox` rejects the ID or cannot authenticate, save stdout/stderr and use the app admin SSH/exec fallback for the same read-only probes: process list, ports 3000/8787, sanitized OpenClaw config shape, recent OpenClaw logs, route probes, and known-regression signatures such as openclaw-42.
+- **Workflow state lane** — inspect Vercel Workflow runs for the incident window with `npx workflow inspect runs --backend vercel`, only after project targeting is verified. Filter for `drainChannelWorkflow`, the channel, request ID, delivery ID, platform event ID, and message time. If `npx workflow` cannot inspect remote Vercel state, save the failure and fall back to Vercel logs plus `/api/admin/logs` events such as `channels.<ch>_workflow_started`, `channels.forward_attempt`, and `channels.forward_outcome`. Do not treat local workflow data as production evidence.
+- **Channel specialist lane** — run `channel_slack`, `channel_telegram`, `channel_discord`, or `channel_whatsapp`. The specialist owns route semantics, signatures/raw body, dedup behavior, boot-message behavior, terminal-path audit, and prior-fix comparison.
+
+Merge gate before fixes: all lane handoffs are present, or any missing lane is explicitly marked unavailable with the reason and fallback used; at least one runtime edge is `verified-bad`; lane evidence does not contradict itself, or the contradiction is the next hypothesis; and the hypothesis table compares prior fixes including openclaw-42, stale sandbox URL, workflow retry exhaustion, channel-specific signature/secret issues, and recent accepted-forward override behavior.
+
 **Before touching code, produce four artifacts:**
 
 1. **Runtime path diagram.** The full delivery pipeline for the channel in question:
@@ -152,9 +184,15 @@ For parallel triage, explicitly spawn project agents and keep ownership narrow:
 | Discord | `channel_discord` | `discord-delivery` | Ed25519 verification, interaction deferral, token expiry, workflow forwarding |
 | WhatsApp | `channel_whatsapp` | `whatsapp-delivery` | Meta verification, raw-body signatures, link-state projection, boot messages |
 
+| Lane | Agent | Evidence focus |
+| --- | --- | --- |
+| Vercel/app logs | `channel_vercel_logs` | Project targeting, deployment proof, admin readiness JSON, Vercel runtime logs |
+| Sandbox runtime | `channel_sandbox_runtime` | `npx sandbox` or app admin SSH fallback, OpenClaw process/ports/config/logs |
+| Workflow state | `channel_workflow_state` | `npx workflow inspect runs --backend vercel`, drain workflow state, fallback log correlation |
+
 Each specialist must return `.agents/skills/channel-debug-core/references/handoff-template.md` before proposing a fix. Specialists may read shared channel core files, but only one implementation owner may edit shared workflow/readiness/summary code in a given task.
 
-Required debugging flow:
+Required debugging flow after the parallel fan-out merge gate:
 
 1. Prove the deployed runtime matches the source: `git rev-parse HEAD`, `git ls-remote origin main`, and a live `GET /api/admin/sandbox-diag` or equivalent build/deploy signal.
 2. Collect `GET /api/admin/why-not-ready`, `GET /api/channels/summary`, `GET /api/admin/sandbox-diag`, and `GET /api/admin/logs` before editing code.

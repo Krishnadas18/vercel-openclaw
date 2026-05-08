@@ -22,6 +22,15 @@ Use after `channel-debug-core` for Telegram issues.
 Telegram update -> /api/channels/telegram/webhook -> secret header validation -> dedup -> fast path to sandbox port 8787 /telegram-webhook OR workflow -> local/public native handler probe -> OpenClaw Telegram provider -> Telegram user-visible reply
 ```
 
+## Parallel Lane Inputs To Consume
+
+Before proposing a Telegram fix, consume:
+
+- Vercel/app logs lane: accepted webhook, planner event, fast-path result, workflow handoff, requestId/deliveryId/update_id, and project targeting proof.
+- Sandbox runtime lane: actual sandboxId, port 8787 listener, local/public `/telegram-webhook` probe, sanitized config has `channels.telegram`, webhookSecret presence without value.
+- Workflow lane: `drainChannelWorkflow` run state and whether 8787 not-listening/ECONNREFUSED triggered reconciliation, with verified project targeting when `.vercel/project.json` differs from the incident target.
+- Prior-fix comparison: webhookSecret flow, suspicious_empty_200, stale 8787 URL refresh, boot-message cleanup.
+
 ## Special Checks
 
 - Port 8787 is not port 3000.
