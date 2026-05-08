@@ -200,6 +200,23 @@ Required debugging flow after the parallel fan-out merge gate:
 4. Report `route-ready`, `native-accepted`, and `user-visible-reply` separately. A green `lastForward` is not proof that a human saw a reply.
 5. Save raw runtime evidence under `.agent-runs/channel-debug/<timestamp>/` and do not commit it. Redact admin secrets, bypass secrets, bot tokens, webhook secrets, and platform access tokens.
 
+### Codex subsystem specialists
+
+Use the repo-local subsystem specialists when the incident is not primarily channel delivery. The custom role files live in `.codex/agents/*.toml`; the reusable playbooks live in `.agents/skills/*/SKILL.md`.
+
+| Area | Agent | Primary skill | Evidence focus |
+| --- | --- | --- | --- |
+| Cron/watchdog | `cron_watchdog` | `cron-watchdog-debug` | Vercel Cron auth, watchdog report checks, cron wake key, token refresh, OpenClaw scheduled-job evidence |
+| Sandbox lifecycle | `sandbox_lifecycle` | `sandbox-lifecycle-debug` | metadata status vs SDK status, create/resume/stop/snapshot/reset, stale-running reconciliation, locks |
+| Gateway/proxy | `gateway_proxy` | `gateway-proxy-debug` | `/gateway`, HTML injection, WebSocket rewrite, waiting page, gateway-token handoff, port URL cache |
+| Firewall/AI Gateway | `firewall_ai_gateway` | `firewall-ai-gateway-debug` | network policy, OIDC token refresh, transform rules, firewall learning/enforcement |
+| Auth/store | `auth_store` | `auth-store-debug` | admin-secret, Vercel auth, sessions, CSRF, Redis vs memory store, keyspace, metadata shape |
+| OpenClaw bootstrap | `openclaw_bootstrap` | `openclaw-bootstrap-debug` | bundle sidecars, config hashes, restore assets, plugin discovery, gateway restart scripts |
+| Launch verification | `launch_verify` | `launch-verify-debug` | preflight, queue ping, ensureRunning, chatCompletions, wakeFromSleep, restorePrepared, channelReadiness |
+| Admin UI | `admin_ui` | `admin-ui-debug` | command shell, action/request helpers, operator UI state, local read-only workflows |
+
+For cron incidents, start with `$cron-watchdog-debug`. It requires deployment proof, a watchdog path diagram, a hypothesis table, sanitized cron job evidence, and a handoff before any fix. Keep Vercel Cron invocation, watchdog authorization, persisted wake due, sandbox wake, token refresh, OpenClaw scheduler execution, and user-visible delivery as separate states.
+
 1. **`GET /api/admin/why-not-ready`** — aggregator. Returns typed `blockers` per channel with `kind`, `evidence`, `suggestedAction`. Single round-trip to "why is this channel red right now?". Implementation: `src/server/admin/why-not-ready.ts` → `buildWhyNotReady()`.
 2. **`GET /api/channels/summary`** — operator-facing readiness. The `slack.lastForward` (and equivalents for other channels) is the live forward outcome from `meta.channelDiagnostics.<ch>.lastForward`: `{ ok, status, classification, attempts, totalMs, sandboxUrl, sandboxId, finalReasonHead, completedAt, ageMs }`. **A green `lastForward.ok:true classification:"accepted"` within 5 minutes overrides a stale `liveConfigSync.outcome:"failed"`** (`src/app/api/channels/summary/route.ts` `buildSlackSummaryEntry`).
 3. **`GET /api/admin/sandbox-diag`** — per-port handler probes. Tells you whether port 3000 returns 200 (gateway up), 401 (Slack handler bound, signature-required), 404 (gateway up but handler not registered), or "Not listening" (sandbox port dead).

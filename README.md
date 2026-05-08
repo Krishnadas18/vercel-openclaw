@@ -237,6 +237,23 @@ Suggested workflow:
 4. Keep `route-ready`, `native-accepted`, and `user-visible-reply` separate in the report. A green `lastForward` is not proof that the user saw a message.
 5. Save raw runtime evidence under `.agent-runs/channel-debug/<timestamp>/` and do not commit it.
 
+## Debugging app subsystems with agents
+
+Channel delivery is only one slice of the wrapper. For cron, lifecycle, proxy, firewall, auth/store, bootstrap, launch verification, and admin UI work, use the matching repo-local Codex agent plus its skill so each investigation starts from the right evidence and file ownership.
+
+| Area | Agent | Primary skill | Focus |
+| ---- | ----- | ------------- | ----- |
+| Cron/watchdog | `cron_watchdog` | `cron-watchdog-debug` | Vercel Cron auth, watchdog reports, cron wake keys, token refresh, OpenClaw job evidence |
+| Sandbox lifecycle | `sandbox_lifecycle` | `sandbox-lifecycle-debug` | create/resume/stop/snapshot/reset, stale-running reconciliation, locks, hot spares |
+| Gateway/proxy | `gateway_proxy` | `gateway-proxy-debug` | `/gateway`, HTML injection, WebSocket rewrite, waiting page, gateway-token handoff |
+| Firewall/AI Gateway | `firewall_ai_gateway` | `firewall-ai-gateway-debug` | network policy, OIDC token refresh, transform rules, egress allowlists |
+| Auth/store | `auth_store` | `auth-store-debug` | admin-secret, Vercel auth, sessions, CSRF, Redis/memory store, keyspace |
+| OpenClaw bootstrap | `openclaw_bootstrap` | `openclaw-bootstrap-debug` | bundle sidecars, config hashes, restore assets, plugin discovery, gateway restart |
+| Launch verification | `launch_verify` | `launch-verify-debug` | preflight, queue ping, chat completions, wake-from-sleep, restorePrepared, remote smoke |
+| Admin UI | `admin_ui` | `admin-ui-debug` | command shell, status panels, action helpers, operator copy, visual verification |
+
+For cron incidents, start with `$cron-watchdog-debug` and keep these states separate: Vercel Cron invoked, watchdog authorized, cron wake due, sandbox woke, AI Gateway token refreshed, OpenClaw cron scheduler loaded jobs, and user-visible delivery happened. Save raw runtime evidence under `.agent-runs/cron-debug/<timestamp>/` and do not commit it.
+
 ## Documentation
 
 | Document | Contents |
