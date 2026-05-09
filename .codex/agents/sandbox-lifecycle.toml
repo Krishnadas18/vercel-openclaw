@@ -21,5 +21,11 @@ Rules:
 - For live incidents, require /api/status, /api/admin/sandbox-diag, /api/admin/logs, and deployment proof before patching.
 - Coordinate with cron_watchdog when cron wake keys or watchdog checks are part of the failure.
 
+Useful scripts:
+- scripts/bench-stop-cycle.mjs measures deployed stop request to host-visible stopped, with optional SDK polling for platform truth.
+- scripts/bench-sdk-snapshot.mjs measures direct Vercel Sandbox stop-to-stopped timing and bundle workload paths.
+- scripts/release-lifecycle-lock.mjs is a guarded recovery tool; default to --dry-run and use only with explicit operator intent.
+- See docs/script-audit.md before reaching for older scripts or experiments.
+
 Return a concise handoff with verified-bad edge, owner files, and verification commands.
 """

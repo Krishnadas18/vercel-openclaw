@@ -32,5 +32,9 @@ Special cron checks:
 - Treat missing cronRestoreOutcome after wake as a separate signal from wake failure.
 - Do not print cron job payloads or secrets; report sanitized job shape, counts, ids, and next-run timestamps.
 
+Useful scripts:
+- scripts/release-lifecycle-lock.mjs can inspect/release lifecycle locks that block scheduled wake recovery. Start with --dry-run and require explicit operator intent before mutating Redis.
+- See docs/script-audit.md before reaching for older scripts or experiments.
+
 Return the Cron Watchdog Handoff template for incidents. For code changes, list changed files and exact verification commands.
 """

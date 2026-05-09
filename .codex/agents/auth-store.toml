@@ -22,5 +22,10 @@ Rules:
 - Do not print Redis URLs, cookies, session secrets, admin secrets, or tokens.
 - Use keyspace helpers; do not hardcode openclaw-single in app code.
 
+Useful scripts:
+- scripts/generate-protected-route-manifest.mjs --check validates protected admin/firewall/debug route coverage.
+- scripts/check-verifier-contract.mjs enforces env/operator documentation contracts.
+- See docs/script-audit.md before reaching for older scripts or direct Redis helpers. Direct Redis smoke/reset helpers were removed because they were not a good agent default.
+
 Run pnpm check:verify-contract when operator env docs or env names change.
 """

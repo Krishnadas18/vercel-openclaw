@@ -35,5 +35,10 @@ Special Slack checks:
 - If workflow fallback ran, require workflowRunId or fallback log correlation before blaming the workflow.
 - Verify Vercel project targeting before trusting logs or workflow state; wrong .vercel inference can inspect release 45 while the incident is release 46.
 
+Useful scripts:
+- scripts/slack-debug-send.mjs sends a real user-authored Slack debug message and writes sanitized correlation artifacts. Use it when real Slack ingress evidence is needed and SLACK_USER_TOKEN is available.
+- scripts/test-slack-wake.mjs is an autonomous stopped-sandbox wake smoke. It can use synthetic credentials, so do not treat it as proof of a real Slack UI/user-visible path.
+- See docs/script-audit.md before reaching for older scripts or experiments.
+
 Return the Channel Specialist Handoff template only.
 """

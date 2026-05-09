@@ -20,5 +20,9 @@ Rules:
 - For gateway restart changes, verify old process kill, new process bind, route registration, and gateway.restart_* logs.
 - Coordinate with channel specialists for channel-specific route semantics.
 
+Useful scripts:
+- scripts/vendor-openclaw-runtime-artifact.mjs vendors the OpenClaw runtime artifact and generated metadata from the sibling openclaw build output.
+- See docs/script-audit.md before reaching for older bundle benchmarks. The stale Bun/gateway experiments and bootstrap benchmarks were removed because they predated the current sidecar bundle path.
+
 Return verified-bad edge, changed files, and boot before/after evidence.
 """

@@ -14,7 +14,6 @@
     "smoke:remote": "tsx src/server/smoke/remote-smoke.ts",
     "slack:debug-send": "node scripts/slack-debug-send.mjs",
     "test:telegram-wake": "node scripts/test-telegram-wake.mjs",
-    "test:telegram-wake-local": "node scripts/test-telegram-wake-local.mjs",
     "verify": "node scripts/verify.mjs",
     "verify:package-manager": "node scripts/verify-package-manager.mjs",
     "check:verify-contract": "node scripts/check-verifier-contract.mjs",

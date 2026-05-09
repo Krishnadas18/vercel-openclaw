@@ -95,24 +95,16 @@ function scanFile(text, file) {
 }
 
 // Exclude meta-guard scripts that legitimately reference pnpm/tsx patterns,
-// plus scripts that benchmark/emulate sandbox bootstrap (sandbox still uses
-// npm until Plan 4b lands).
+// plus the maintained SDK snapshot benchmark that can run in-sandbox npm as an
+// explicit workload argument until Plan 4b lands.
 const EXCLUDED_FILES = new Set([
   "scripts/audit-verifier-surface.mjs",
   "scripts/verify-package-manager.mjs",
   "scripts/check-verifier-contract.mjs",
   "scripts/test-self-heal.ts",
   "scripts/vendor-openclaw-runtime-artifact.mjs",
-  "scripts/bench-sandbox-direct.mjs",
-  "scripts/bench-bundle-bootstrap.mjs",
   "scripts/bench-sdk-snapshot.mjs",
 ]);
-
-// Exclude directories whose contents legitimately shell out to npm inside
-// the sandbox. Plan 4b will migrate these together.
-const EXCLUDED_DIR_PREFIXES = [
-  "scripts/experiments/",
-];
 
 const packageJsonPath = join(ROOT, "package.json");
 let packageManager = null;
@@ -127,11 +119,7 @@ const files = Array.from(new Set(CANDIDATE_PATHS.flatMap(collectFiles))).sort();
 
 const findings = files
   .flatMap((file) => scanFile(readFileSync(join(ROOT, file), "utf8"), file))
-  .filter(
-    (f) =>
-      !EXCLUDED_FILES.has(f.file) &&
-      !EXCLUDED_DIR_PREFIXES.some((prefix) => f.file.startsWith(prefix)),
-  );
+  .filter((f) => !EXCLUDED_FILES.has(f.file));
 
 const result = {
   ok:

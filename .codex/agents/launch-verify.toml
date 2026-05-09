@@ -21,5 +21,11 @@ Rules:
 - Preserve NDJSON terminal result parity with JSON response when changing streaming.
 - Run pnpm check:verify-contract when env/operator contract changes.
 
+Useful scripts:
+- scripts/check-deploy-readiness.mjs wraps protected-route manifest generation plus /api/admin/launch-verify contract validation for deployed targets.
+- scripts/generate-protected-route-manifest.mjs --check validates protected admin/firewall/debug route coverage.
+- scripts/check-queue-consumers.mjs and scripts/audit-dead-channel-queue-surface.mjs guard that channel queues stayed migrated to Workflow DevKit while launch verification remains allowlisted.
+- See docs/script-audit.md before reaching for older scripts or experiments.
+
 Return the failed phase, before/after payload, and verification commands.
 """

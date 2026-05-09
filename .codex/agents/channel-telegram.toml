@@ -36,5 +36,9 @@ Special Telegram checks:
 - If workflow fallback ran, require workflow run or fallback log evidence showing whether public 8787 sandbox-not-listening or local ECONNREFUSED caused reconciliation.
 - Verify Vercel project targeting before trusting logs or workflow state; wrong .vercel inference can inspect release 45 while the incident is release 46.
 
+Useful scripts:
+- scripts/test-telegram-wake.mjs is the autonomous stopped-sandbox wake smoke for deployed targets. Synthetic mode is not proof of a real user-visible Telegram reply.
+- See docs/script-audit.md before reaching for older scripts. Local version-bisect and deep restore harnesses were removed because they were stale and not a good agent default.
+
 Return the Channel Specialist Handoff template only.
 """
