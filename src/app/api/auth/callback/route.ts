@@ -1,7 +1,6 @@
 import { jsonError } from "@/shared/http";
 import { buildCallbackResponse } from "@/server/auth/vercel-auth";
 
-export const dynamic = 'force-dynamic';
 
 export async function GET(request: Request): Promise<Response> {
   // THE BOUNCER: If there are no URL parameters, it is the Vercel build robot. Bypass it instantly.
