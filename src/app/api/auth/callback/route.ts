@@ -16,3 +16,5 @@ export async function GET(request: Request): Promise<Response> {
     return jsonError(error);
   }
 }
+
+// Triggering fresh Vercel build
